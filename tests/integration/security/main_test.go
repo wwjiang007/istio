@@ -59,6 +59,10 @@ func setupConfig(ctx resource.Context, cfg *istio.Config) {
 	serviceWithNamespace := fmt.Sprintf("%s/%s", extAuthzNamespace, service)
 
 	cfg.ControlPlaneValues = fmt.Sprintf(`
+values:
+  pilot: 
+    env: 
+      PILOT_JWT_ENABLE_REMOTE_JWKS: true
 meshConfig:
   accessLogEncoding: JSON
   accessLogFile: /dev/stdout
@@ -75,6 +79,16 @@ meshConfig:
   - name: "ext-authz-grpc"
     envoyExtAuthzGrpc:
       service: %q
+      port: 9000
+  - name: "ext-authz-http-local"
+    envoyExtAuthzHttp:
+      service: ext-authz-http.local
+      port: 8000
+      pathPrefix: "/check"
+      includeHeadersInCheck: ["x-ext-authz"]
+  - name: "ext-authz-grpc-local"
+    envoyExtAuthzGrpc:
+      service: ext-authz-grpc.local
       port: 9000
 `, service, serviceWithNamespace)
 }

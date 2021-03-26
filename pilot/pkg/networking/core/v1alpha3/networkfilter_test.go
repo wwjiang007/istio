@@ -62,7 +62,7 @@ func TestInboundNetworkFilterStatPrefix(t *testing.T) {
 		{
 			"no pattern",
 			"",
-			"inbound|9999||",
+			"inbound|8888||",
 		},
 		{
 			"service only pattern",
@@ -77,9 +77,8 @@ func TestInboundNetworkFilterStatPrefix(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-
 			env := buildListenerEnv(services)
-			env.PushContext.InitContext(&env, nil, nil)
+			env.PushContext.InitContext(env, nil, nil)
 			env.PushContext.Mesh.InboundClusterStatName = tt.statPattern
 
 			instance := &model.ServiceInstance{
@@ -96,10 +95,12 @@ func TestInboundNetworkFilterStatPrefix(t *testing.T) {
 					Port: 9999,
 					Name: "http",
 				},
-				Endpoint: &model.IstioEndpoint{},
+				Endpoint: &model.IstioEndpoint{
+					EndpointPort: 8888,
+				},
 			}
 
-			listeners := buildInboundNetworkFilters(env.PushContext, instance, &model.Proxy{})
+			listeners := buildInboundNetworkFilters(env.PushContext, instance, &model.Proxy{}, model.BuildInboundSubsetKey(int(instance.Endpoint.EndpointPort)))
 			tcp := &tcp.TcpProxy{}
 			ptypes.UnmarshalAny(listeners[0].GetTypedConfig(), tcp)
 			if tcp.StatPrefix != tt.expectedStatPrefix {
@@ -204,9 +205,8 @@ func TestOutboundNetworkFilterStatPrefix(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-
 			env := buildListenerEnv(services)
-			env.PushContext.InitContext(&env, nil, nil)
+			env.PushContext.InitContext(env, nil, nil)
 			env.PushContext.Mesh.OutboundClusterStatName = tt.statPattern
 
 			proxy := getProxy()

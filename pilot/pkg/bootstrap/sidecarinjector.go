@@ -38,9 +38,7 @@ const (
 	defaultInjectorConfigMapName = "istio-sidecar-injector"
 )
 
-var (
-	injectionEnabled = env.RegisterBoolVar("INJECT_ENABLED", true, "Enable mutating webhook handler.")
-)
+var injectionEnabled = env.RegisterBoolVar("INJECT_ENABLED", true, "Enable mutating webhook handler.")
 
 func (s *Server) initSidecarInjector(args *PilotArgs) (*inject.Webhook, error) {
 	// currently the constant: "./var/lib/istio/inject"
@@ -78,12 +76,10 @@ func (s *Server) initSidecarInjector(args *PilotArgs) (*inject.Webhook, error) {
 	log.Info("initializing sidecar injector")
 
 	parameters := inject.WebhookParameters{
-		Watcher: watcher,
-		Env:     s.environment,
-		// Disable monitoring. The injection metrics will be picked up by Pilots metrics exporter already
-		MonitoringPort: -1,
-		Mux:            s.httpsMux,
-		Revision:       args.Revision,
+		Watcher:  watcher,
+		Env:      s.environment,
+		Mux:      s.httpsMux,
+		Revision: args.Revision,
 	}
 
 	wh, err := inject.NewWebhook(parameters)
@@ -100,12 +96,18 @@ func (s *Server) initSidecarInjector(args *PilotArgs) (*inject.Webhook, error) {
 			if hasCustomTLSCerts(args.ServerOptions.TLSOptions) {
 				caBundlePath = args.ServerOptions.TLSOptions.CaCertFile
 			}
-			webhooks.PatchCertLoop(features.InjectionWebhookConfigName.Get(), webhookName, caBundlePath, s.kubeClient, stop)
+			patcher, err := webhooks.NewWebhookCertPatcher(s.kubeClient, args.Revision, webhookName, caBundlePath)
+			if err != nil {
+				log.Errorf("failed to create webhook cert patcher: %v", err)
+				return nil
+			}
+
+			patcher.Run(stop)
 			return nil
 		})
 	}
 	s.addStartFunc(func(stop <-chan struct{}) error {
-		go wh.Run(stop)
+		wh.Run(stop)
 		return nil
 	})
 	return wh, nil

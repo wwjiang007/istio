@@ -29,7 +29,6 @@ import (
 	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/tests/integration/security/util"
 	"istio.io/istio/tests/integration/security/util/connection"
-	"istio.io/pkg/log"
 )
 
 // TestCase represents reachability test cases.
@@ -52,6 +51,9 @@ type TestCase struct {
 
 	// Indicates whether the test should expect a successful response.
 	ExpectSuccess func(src echo.Instance, opts echo.CallOptions) bool
+
+	// Indicates whether the test should expect a MTLS response.
+	ExpectMTLS func(src echo.Instance, opts echo.CallOptions) bool
 
 	// Indicates whether a test should be run in the multicluster environment.
 	// This is a temporary flag during the converting tests into multicluster supported.
@@ -78,6 +80,10 @@ func Run(testCases []TestCase, ctx framework.TestContext, apps *util.EchoDeploym
 			PortName: "grpc",
 			Scheme:   scheme.GRPC,
 		},
+		{
+			PortName: "https",
+			Scheme:   scheme.HTTPS,
+		},
 	}
 
 	for _, c := range testCases {
@@ -88,35 +94,33 @@ func Run(testCases []TestCase, ctx framework.TestContext, apps *util.EchoDeploym
 		}
 		testName := strings.TrimSuffix(c.ConfigFile, filepath.Ext(c.ConfigFile))
 		test := ctx.NewSubTest(testName)
-		test.Run(func(ctx framework.TestContext) {
+		test.Run(func(t framework.TestContext) {
 			// Apply the policy.
-			policyYAML := file.AsStringOrFail(ctx, filepath.Join("./testdata", c.ConfigFile))
-			retry.UntilSuccessOrFail(ctx, func() error {
-				ctx.Logf("[%s] [%v] Apply config %s", testName, time.Now(), c.ConfigFile)
+			policyYAML := file.AsStringOrFail(t, filepath.Join("./testdata", c.ConfigFile))
+			retry.UntilSuccessOrFail(t, func() error {
+				t.Logf("[%s] [%v] Apply config %s", testName, time.Now(), c.ConfigFile)
 				// TODO(https://github.com/istio/istio/issues/20460) We shouldn't need a retry loop
-				return ctx.Config().ApplyYAML(c.Namespace.Name(), policyYAML)
+				return t.Config().ApplyYAML(c.Namespace.Name(), policyYAML)
 			})
-			ctx.NewSubTest("wait for config").Run(func(ctx framework.TestContext) {
-				util.WaitForConfigWithSleep(ctx, policyYAML, c.Namespace)
-			})
-
-			ctx.Cleanup(func() {
-				if err := retry.UntilSuccess(func() error {
-					return ctx.Config().DeleteYAML(c.Namespace.Name(), policyYAML)
-				}); err != nil {
-					log.Errorf("failed to delete configuration: %v", err)
-				}
+			t.NewSubTest("wait for config").Run(func(t framework.TestContext) {
+				util.WaitForConfig(t, policyYAML, c.Namespace)
 			})
 			for _, clients := range []echo.Instances{apps.A, apps.B.Match(echo.Namespace(apps.Namespace1.Name())), apps.Headless, apps.Naked, apps.HeadlessNaked} {
 				for _, client := range clients {
-					ctx.NewSubTest(fmt.Sprintf("%s in %s",
-						client.Config().Service, client.Config().Cluster.Name())).Run(func(ctx framework.TestContext) {
+					t.NewSubTest(fmt.Sprintf("%s in %s",
+						client.Config().Service, client.Config().Cluster.StableName())).Run(func(t framework.TestContext) {
 						aSet := apps.A
 						bSet := apps.B
-						// TODO: check why 503 is received for global-plaintext.yaml (https://github.com/istio/istio/issues/28766)
+						vmSet := apps.VM
+
 						if c.ConfigFile == "global-plaintext.yaml" {
+							// TODO: cross-network traffic fails because istiod can't filter endpoints set to non-mTLS via PeerAuthentication
+							// TODO (cont): setting callCount to 1 seems to avoid this somehow See https://github.com/istio/istio/issues/28798
 							aSet = apps.A.Match(echo.InCluster(client.Config().Cluster))
 							bSet = apps.B.Match(echo.InCluster(client.Config().Cluster))
+							if len(vmSet) > 0 {
+								vmSet = vmSet[:1]
+							}
 						}
 						destinationSets := []echo.Instances{
 							aSet,
@@ -127,8 +131,7 @@ func Run(testCases []TestCase, ctx framework.TestContext, apps *util.EchoDeploym
 							apps.Multiversion.Match(echo.InCluster(client.Config().Cluster)),
 							// only hit same cluster naked services
 							apps.Naked.Match(echo.InCluster(client.Config().Cluster)),
-							// only hit same cluster vm services
-							apps.VM.Match(echo.InCluster(client.Config().Cluster)),
+							vmSet,
 							// only hit same cluster headless services
 							apps.HeadlessNaked.Match(echo.InCluster(client.Config().Cluster)),
 						}
@@ -143,11 +146,12 @@ func Run(testCases []TestCase, ctx framework.TestContext, apps *util.EchoDeploym
 							// grabbing the 0th assumes all echos in destinations have the same service name
 							destination := destinations[0]
 							// TODO: fix Multiversion related test in multicluster
-							if ctx.Clusters().IsMulticluster() && apps.Multiversion.Contains(destination) {
+							if t.Clusters().IsMulticluster() && apps.Multiversion.Contains(destination) {
 								continue
 							}
 							if (apps.IsHeadless(client) || apps.IsHeadless(destination) || apps.IsNaked(client)) && len(destClusters) > 1 {
 								// TODO(landow) fix DNS issues with multicluster/VMs/headless
+								t.SkipNow()
 								continue
 							}
 							if isNakedToVM(apps, client, destination) {
@@ -178,7 +182,7 @@ func Run(testCases []TestCase, ctx framework.TestContext, apps *util.EchoDeploym
 
 								if c.Include(src, opts) {
 									expectSuccess := c.ExpectSuccess(src, opts)
-
+									expectMTLS := c.ExpectMTLS(src, opts)
 									tpe := "positive"
 									if !expectSuccess {
 										tpe = "negative"
@@ -190,7 +194,7 @@ func Run(testCases []TestCase, ctx framework.TestContext, apps *util.EchoDeploym
 										opts.Path,
 										tpe)
 
-									ctx.NewSubTest(subTestName).
+									t.NewSubTest(subTestName).
 										RunParallel(func(ctx framework.TestContext) {
 											if onPreRun != nil {
 												onPreRun(ctx, src, opts)
@@ -201,6 +205,7 @@ func Run(testCases []TestCase, ctx framework.TestContext, apps *util.EchoDeploym
 												DestClusters:  destClusters,
 												Options:       opts,
 												ExpectSuccess: expectSuccess,
+												ExpectMTLS:    expectMTLS,
 											}
 											checker.CheckOrFail(ctx)
 										})

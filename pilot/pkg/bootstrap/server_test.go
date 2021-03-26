@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/server"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pkg/config/constants"
@@ -32,7 +33,7 @@ import (
 	"istio.io/pkg/filewatcher"
 )
 
-func TestNewServerWithExternalCertificates(t *testing.T) {
+func TestNewServerCertInit(t *testing.T) {
 	configDir, err := ioutil.TempDir("", "test_istiod_config")
 	if err != nil {
 		t.Fatal(err)
@@ -64,45 +65,122 @@ func TestNewServerWithExternalCertificates(t *testing.T) {
 		t.Fatalf("WriteFile(%v) failed: %v", caCertFile, err)
 	}
 
-	tlsOptions := TLSOptions{
-		CertFile:   certFile,
-		KeyFile:    keyFile,
-		CaCertFile: caCertFile,
+	certFileEmpty := filepath.Join(certsDir, "cert-file-empty.pem")
+	keyFileEmpty := filepath.Join(certsDir, "key-file-empty.pem")
+	caCertFileEmpty := filepath.Join(certsDir, "ca-cert-empty.pem")
+
+	// create empty files.
+	if err := ioutil.WriteFile(certFileEmpty, []byte{}, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", certFile, err)
+	}
+	if err := ioutil.WriteFile(keyFileEmpty, []byte{}, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", keyFile, err)
+	}
+	if err := ioutil.WriteFile(caCertFileEmpty, []byte{}, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", caCertFile, err)
 	}
 
-	args := NewPilotArgs(func(p *PilotArgs) {
-		p.Namespace = "istio-system"
-		p.ServerOptions = DiscoveryServerOptions{
-			// Dynamically assign all ports.
-			HTTPAddr:       ":0",
-			MonitoringAddr: ":0",
-			GRPCAddr:       ":0",
-			SecureGRPCAddr: ":0",
-			TLSOptions:     tlsOptions,
-		}
-		p.RegistryOptions = RegistryOptions{
-			FileDir: configDir,
-		}
+	cases := []struct {
+		name         string
+		tlsOptions   *TLSOptions
+		enableCA     bool
+		certProvider string
+		expNewCert   bool
+		expCert      []byte
+		expKey       []byte
+	}{
+		{
+			name: "Load from existing DNS cert",
+			tlsOptions: &TLSOptions{
+				CertFile:   certFile,
+				KeyFile:    keyFile,
+				CaCertFile: caCertFile,
+			},
+			enableCA:     false,
+			certProvider: KubernetesCAProvider,
+			expNewCert:   false,
+			expCert:      testcerts.ServerCert,
+			expKey:       testcerts.ServerKey,
+		},
+		{
+			name: "Create new DNS cert using Istiod",
+			tlsOptions: &TLSOptions{
+				CertFile:   "",
+				KeyFile:    "",
+				CaCertFile: "",
+			},
+			enableCA:     true,
+			certProvider: IstiodCAProvider,
+			expNewCert:   true,
+			expCert:      []byte{},
+			expKey:       []byte{},
+		},
+		{
+			name: "No DNS cert created because CA is disabled",
+			tlsOptions: &TLSOptions{
+				CertFile:   certFileEmpty,
+				KeyFile:    keyFileEmpty,
+				CaCertFile: caCertFileEmpty,
+			},
+			enableCA:     false,
+			certProvider: IstiodCAProvider,
+			expNewCert:   false,
+			expCert:      []byte{},
+			expKey:       []byte{},
+		},
+	}
 
-		// Include all of the default plugins
-		p.Plugins = DefaultPlugins
-		p.ShutdownDuration = 1 * time.Millisecond
-	})
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			os.Setenv("PILOT_CERT_PROVIDER", c.certProvider)
+			features.EnableCAServer = c.enableCA
+			args := NewPilotArgs(func(p *PilotArgs) {
+				p.Namespace = "istio-system"
+				p.ServerOptions = DiscoveryServerOptions{
+					// Dynamically assign all ports.
+					HTTPAddr:       ":0",
+					MonitoringAddr: ":0",
+					GRPCAddr:       ":0",
+					SecureGRPCAddr: ":0",
+					TLSOptions:     *c.tlsOptions,
+				}
+				p.RegistryOptions = RegistryOptions{
+					FileDir: configDir,
+				}
 
-	g := NewWithT(t)
-	s, err := NewServer(args)
-	g.Expect(err).To(Succeed())
+				// Include all of the default plugins
+				p.Plugins = DefaultPlugins
+				p.ShutdownDuration = 1 * time.Millisecond
+			})
+			g := NewWithT(t)
+			s, err := NewServer(args)
+			g.Expect(err).To(Succeed())
+			stop := make(chan struct{})
+			g.Expect(s.Start(stop)).To(Succeed())
+			defer func() {
+				close(stop)
+				s.WaitUntilCompletion()
+				features.EnableCAServer = true
+				os.Setenv("PILOT_CERT_PROVIDER", IstiodCAProvider)
+			}()
 
-	stop := make(chan struct{})
-	features.EnableCAServer = false
-	g.Expect(s.Start(stop)).To(Succeed())
-	defer func() {
-		close(stop)
-		s.WaitUntilCompletion()
-	}()
-
-	// Validate server started with the provided cert
-	checkCert(t, s, testcerts.ServerCert, testcerts.ServerKey)
+			if c.expNewCert {
+				if istiodCert, err := s.getIstiodCertificate(nil); istiodCert == nil || err != nil {
+					t.Errorf("Istiod failed to generate new DNS cert")
+				}
+			} else {
+				if len(c.expCert) != 0 {
+					if !checkCert(t, s, c.expCert, c.expKey) {
+						t.Errorf("Istiod certifiate does not match the expectation")
+					}
+				} else {
+					if cert, _ := s.getIstiodCertificate(nil); cert != nil {
+						t.Errorf("Istiod should not generate new DNS cert")
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestReloadIstiodCert(t *testing.T) {
@@ -110,6 +188,7 @@ func TestReloadIstiodCert(t *testing.T) {
 	stop := make(chan struct{})
 	s := &Server{
 		fileWatcher: filewatcher.NewWatcher(),
+		server:      server.New(),
 	}
 
 	defer func() {
@@ -138,19 +217,18 @@ func TestReloadIstiodCert(t *testing.T) {
 	}
 
 	// setup cert watches.
-	err = s.initCertificateWatches(tlsOptions)
-	for _, fn := range s.startFuncs {
-		if err := fn(stop); err != nil {
-			t.Fatalf("Could not invoke startFuncs: %v", err)
-		}
-	}
-
-	if err != nil {
+	if err = s.initCertificateWatches(tlsOptions); err != nil {
 		t.Fatalf("initCertificateWatches failed: %v", err)
 	}
 
+	if err = s.server.Start(stop); err != nil {
+		t.Fatalf("Could not invoke startFuncs: %v", err)
+	}
+
 	// Validate that the certs are loaded.
-	checkCert(t, s, testcerts.ServerCert, testcerts.ServerKey)
+	if !checkCert(t, s, testcerts.ServerCert, testcerts.ServerKey) {
+		t.Errorf("Istiod certifiate does not match the expectation")
+	}
 
 	// Update cert/key files.
 	if err := ioutil.WriteFile(tlsOptions.CertFile, testcerts.RotatedCert, 0644); err != nil { // nolint: vetshadow
@@ -176,11 +254,18 @@ func TestNewServer(t *testing.T) {
 		domain         string
 		expectedDomain string
 		secureGRPCport string
+		jwtRule        string
 	}{
 		{
 			name:           "default domain",
 			domain:         "",
 			expectedDomain: constants.DefaultKubernetesDomain,
+		},
+		{
+			name:           "default domain with JwtRule",
+			domain:         "",
+			expectedDomain: constants.DefaultKubernetesDomain,
+			jwtRule:        `{"issuer": "foo", "jwks_uri": "baz", "audiences": ["aud1", "aud2"]}`,
 		},
 		{
 			name:           "override domain",
@@ -225,6 +310,8 @@ func TestNewServer(t *testing.T) {
 				// Include all of the default plugins
 				p.Plugins = DefaultPlugins
 				p.ShutdownDuration = 1 * time.Millisecond
+
+				p.JwtRule = c.jwtRule
 			})
 
 			g := NewWithT(t)
@@ -238,7 +325,7 @@ func TestNewServer(t *testing.T) {
 				s.WaitUntilCompletion()
 			}()
 
-			g.Expect(s.environment.GetDomainSuffix()).To(Equal(c.expectedDomain))
+			g.Expect(s.environment.DomainSuffix).To(Equal(c.expectedDomain))
 		})
 	}
 }
@@ -306,6 +393,43 @@ func TestNewServerWithMockRegistry(t *testing.T) {
 			}()
 
 			g.Expect(s.ServiceController().GetRegistries()[1].Provider()).To(Equal(c.expectedRegistry))
+		})
+	}
+}
+
+func TestInitOIDC(t *testing.T) {
+	tests := []struct {
+		name      string
+		expectErr bool
+		jwtRule   string
+	}{
+		{
+			name:      "valid jwt rule",
+			expectErr: false,
+			jwtRule:   `{"issuer": "foo", "jwks_uri": "baz", "audiences": ["aud1", "aud2"]}`,
+		},
+		{
+			name:      "invalid jwt rule",
+			expectErr: true,
+			jwtRule:   "invalid",
+		},
+		{
+			name:      "jwt rule with invalid audiences",
+			expectErr: true,
+			// audiences must be a string array
+			jwtRule: `{"issuer": "foo", "jwks_uri": "baz", "audiences": "aud1"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := &PilotArgs{JwtRule: tt.jwtRule}
+
+			_, err := initOIDC(args, "domain-foo")
+			gotErr := err != nil
+			if gotErr != tt.expectErr {
+				t.Errorf("expect error is %v while actual error is %v", tt.expectErr, gotErr)
+			}
 		})
 	}
 }

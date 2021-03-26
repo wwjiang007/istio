@@ -18,6 +18,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -31,6 +33,8 @@ import (
 	prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	prom "github.com/prometheus/client_golang/prometheus"
 	"github.com/soheilhy/cmux"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
@@ -39,16 +43,18 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
+	"istio.io/api/security/v1beta1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/plugin"
 	kubesecrets "istio.io/istio/pilot/pkg/secrets/kube"
-	securityModel "istio.io/istio/pilot/pkg/security/model"
+	"istio.io/istio/pilot/pkg/server"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
 	"istio.io/istio/pilot/pkg/status"
+	tb "istio.io/istio/pilot/pkg/trustbundle"
 	"istio.io/istio/pilot/pkg/xds"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/config"
@@ -56,10 +62,10 @@ import (
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
-	"istio.io/istio/pkg/jwt"
 	istiokeepalive "istio.io/istio/pkg/keepalive"
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/inject"
+	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/security/pkg/k8s/chiron"
 	"istio.io/istio/security/pkg/pki/ca"
@@ -72,16 +78,13 @@ import (
 	"istio.io/pkg/version"
 )
 
-var (
-	// DefaultPlugins is the default list of plugins to enable, when no plugin(s)
-	// is specified through the command line
-	DefaultPlugins = []string{
-		plugin.AuthzCustom,
-		plugin.Authn,
-		plugin.Authz,
-		plugin.Health,
-	}
-)
+// DefaultPlugins is the default list of plugins to enable, when no plugin(s)
+// is specified through the command line
+var DefaultPlugins = []string{
+	plugin.AuthzCustom,
+	plugin.Authn,
+	plugin.Authz,
+}
 
 const (
 	// debounce file watcher events to minimize noise in logs
@@ -101,16 +104,11 @@ func init() {
 	pilotVersion.With(prom.Labels{"version": version.Info.String()}).Set(1)
 }
 
-// startFunc defines a function that will be used to start one or more components of the Pilot discovery service.
-type startFunc func(stop <-chan struct{}) error
-
 // readinessProbe defines a function that will be used indicate whether a server is ready.
 type readinessProbe func() (bool, error)
 
 // Server contains the runtime configuration for the Pilot discovery service.
 type Server struct {
-	MonitorListeningAddr net.Addr
-
 	XDSServer *xds.DiscoveryServer
 
 	clusterID   string
@@ -147,6 +145,7 @@ type Server struct {
 	httpsMux *http.ServeMux // webhooks
 
 	HTTPListener       net.Listener
+	HTTP2Listener      net.Listener
 	GRPCListener       net.Listener
 	SecureGrpcListener net.Listener
 
@@ -156,26 +155,26 @@ type Server struct {
 	certController *chiron.WebhookController
 	CA             *ca.IstioCA
 	RA             ra.RegistrationAuthority
+
+	// TrustAnchors for workload to workload mTLS
+	workloadTrustBundle *tb.TrustBundle
 	// path to the caBundle that signs the DNS certs. This should be agnostic to provider.
 	caBundlePath string
-	certMu       sync.Mutex
+	certMu       sync.RWMutex
 	istiodCert   *tls.Certificate
-	jwtPath      string
+	server       server.Instance
 
-	// startFuncs keeps track of functions that need to be executed when Istiod starts.
-	startFuncs []startFunc
 	// requiredTerminations keeps track of components that should block server exit
 	// if they are not stopped. This allows important cleanup tasks to be completed.
 	// Note: this is still best effort; a process can die at any time.
-	requiredTerminations sync.WaitGroup
-	statusReporter       *status.Reporter
-	readinessProbes      map[string]readinessProbe
+	readinessProbes map[string]readinessProbe
 
 	// duration used for graceful shutdown.
 	shutdownDuration time.Duration
 
-	// The SPIFFE based cert verifier
-	peerCertVerifier *spiffe.PeerCertVerifier
+	statusReporter *status.Reporter
+	// RWConfigStore is the configstore which allows updates, particularly for status.
+	RWConfigStore model.ConfigStoreCache
 }
 
 // NewServer creates a new Server instance based on the provided arguments.
@@ -185,20 +184,25 @@ func NewServer(args *PilotArgs) (*Server, error) {
 		DomainSuffix: args.RegistryOptions.KubeOptions.DomainSuffix,
 	}
 	e.SetLedger(buildLedger(args.RegistryOptions))
+
 	ac := aggregate.NewController(aggregate.Options{
 		MeshHolder: e,
 	})
 	e.ServiceDiscovery = ac
 
 	s := &Server{
-		clusterID:       getClusterID(args),
-		environment:     e,
-		XDSServer:       xds.NewDiscoveryServer(e, args.Plugins, args.PodName),
-		fileWatcher:     filewatcher.NewWatcher(),
-		httpMux:         http.NewServeMux(),
-		monitoringMux:   http.NewServeMux(),
-		readinessProbes: make(map[string]readinessProbe),
+		clusterID:           getClusterID(args),
+		environment:         e,
+		fileWatcher:         filewatcher.NewWatcher(),
+		httpMux:             http.NewServeMux(),
+		monitoringMux:       http.NewServeMux(),
+		readinessProbes:     make(map[string]readinessProbe),
+		workloadTrustBundle: tb.NewTrustBundle(nil),
+		server:              server.New(),
 	}
+	// Initialize workload Trust Bundle before XDS Server
+	e.TrustBundle = s.workloadTrustBundle
+	s.XDSServer = xds.NewDiscoveryServer(e, args.Plugins, args.PodName, args.Namespace)
 
 	if args.ShutdownDuration == 0 {
 		s.shutdownDuration = 10 * time.Second // If not specified set to 10 seconds.
@@ -231,13 +235,18 @@ func NewServer(args *PilotArgs) (*Server, error) {
 
 	s.initMeshNetworks(args, s.fileWatcher)
 	s.initMeshHandlers()
+	s.environment.Init()
 
 	// Options based on the current 'defaults' in istio.
 	caOpts := &caOptions{
-		TrustDomain:      s.environment.Mesh().TrustDomain,
-		Namespace:        args.Namespace,
-		ExternalCAType:   ra.CaExternalType(externalCaType),
-		ExternalCASigner: k8sSigner,
+		TrustDomain:    s.environment.Mesh().TrustDomain,
+		Namespace:      args.Namespace,
+		ExternalCAType: ra.CaExternalType(externalCaType),
+	}
+
+	if caOpts.ExternalCAType == ra.ExtCAK8s {
+		// Older environment variable preserved for backward compatibility
+		caOpts.ExternalCASigner = k8sSigner
 	}
 
 	// CA signing certificate must be created first if needed.
@@ -249,7 +258,10 @@ func NewServer(args *PilotArgs) (*Server, error) {
 		return nil, err
 	}
 
-	s.initJwtPolicy()
+	// Initialize workloadTrustBundle after CA has been initialized
+	if err := s.initWorkloadTrustBundle(args); err != nil {
+		return nil, err
+	}
 
 	// Parse and validate Istiod Address.
 	istiodHost, _, err := e.GetDiscoveryAddress()
@@ -259,11 +271,6 @@ func NewServer(args *PilotArgs) (*Server, error) {
 
 	// Create Istiod certs and setup watches.
 	if err := s.initIstiodCerts(args, string(istiodHost)); err != nil {
-		return nil, err
-	}
-
-	// Initialize the SPIFFE peer cert verifier.
-	if err := s.setPeerCertVerifier(args.ServerOptions.TLSOptions); err != nil {
 		return nil, err
 	}
 
@@ -297,15 +304,24 @@ func NewServer(args *PilotArgs) (*Server, error) {
 	// authenticators are activated sequentially and the first successful attempt
 	// is used as the authentication result.
 	// The JWT authenticator requires the multicluster registry to be initialized, so we build this later
-	authenticators := []authenticate.Authenticator{
+	authenticators := []security.Authenticator{
 		&authenticate.ClientCertAuthenticator{},
 		kubeauth.NewKubeJWTAuthenticator(s.kubeClient, s.clusterID, s.multicluster.GetRemoteKubeClient, spiffe.GetTrustDomain(), features.JwtPolicy.Get()),
 	}
-
-	caOpts.Authenticators = authenticators
+	if args.JwtRule != "" {
+		jwtAuthn, err := initOIDC(args, s.environment.Mesh().TrustDomain)
+		if err != nil {
+			return nil, fmt.Errorf("error initializing OIDC: %v", err)
+		}
+		if jwtAuthn == nil {
+			return nil, fmt.Errorf("JWT authenticator is nil")
+		}
+		authenticators = append(authenticators, jwtAuthn)
+	}
 	if features.XDSAuth {
 		s.XDSServer.Authenticators = authenticators
 	}
+	caOpts.Authenticators = authenticators
 
 	// Start CA or RA server. This should be called after CA and Istiod certs have been created.
 	s.startCA(caOpts)
@@ -330,6 +346,23 @@ func NewServer(args *PilotArgs) (*Server, error) {
 	return s, nil
 }
 
+func initOIDC(args *PilotArgs, trustDomain string) (security.Authenticator, error) {
+	// JWTRule is from the JWT_RULE environment variable.
+	// An example of json string for JWTRule is:
+	//`{"issuer": "foo", "jwks_uri": "baz", "audiences": ["aud1", "aud2"]}`.
+	jwtRule := v1beta1.JWTRule{}
+	err := json.Unmarshal([]byte(args.JwtRule), &jwtRule)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JWT rule: %v", err)
+	}
+	log.Infof("Istiod authenticating using JWTRule: %v", jwtRule)
+	jwtAuthn, err := authenticate.NewJwtAuthenticator(&jwtRule, trustDomain)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create the JWT authenticator: %v", err)
+	}
+	return jwtAuthn, nil
+}
+
 func getClusterID(args *PilotArgs) string {
 	clusterID := args.RegistryOptions.KubeOptions.ClusterID
 	if clusterID == "" {
@@ -340,66 +373,89 @@ func getClusterID(args *PilotArgs) string {
 	return clusterID
 }
 
+func isUnexpectedListenerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	if errors.Is(err, http.ErrServerClosed) {
+		return false
+	}
+	if errors.Is(err, cmux.ErrListenerClosed) {
+		return false
+	}
+	return true
+}
+
 // Start starts all components of the Pilot discovery service on the port specified in DiscoveryServerOptions.
 // If Port == 0, a port number is automatically chosen. Content serving is started by this method,
 // but is executed asynchronously. Serving can be canceled at any time by closing the provided stop channel.
 func (s *Server) Start(stop <-chan struct{}) error {
 	log.Infof("Starting Istiod Server with primary cluster %s", s.clusterID)
 
-	// Now start all of the components.
-	for _, fn := range s.startFuncs {
-		if err := fn(stop); err != nil {
-			return err
-		}
+	if features.UnsafeFeaturesEnabled() {
+		log.Warn("Server is starting with unsafe features enabled")
 	}
+
+	// Now start all of the components.
+	if err := s.server.Start(stop); err != nil {
+		return err
+	}
+	if !s.waitForCacheSync(stop) {
+		return fmt.Errorf("failed to sync cache")
+	}
+	// Inform Discovery Server so that it can start accepting connections.
+	s.XDSServer.CachesSynced()
+
 	// Race condition - if waitForCache is too fast and we run this as a startup function,
 	// the grpc server would be started before CA is registered. Listening should be last.
 	if s.SecureGrpcListener != nil {
 		go func() {
-			if !s.waitForCacheSync(stop) {
-				return
-			}
 			log.Infof("starting secure gRPC discovery service at %s", s.SecureGrpcListener.Addr())
 			if err := s.secureGrpcServer.Serve(s.SecureGrpcListener); err != nil {
-				log.Errorf("error from GRPC server: %v", err)
+				log.Errorf("error serving secure GRPC server: %v", err)
 			}
 		}()
 	}
 
-	// grpcServer is shared by Galley, CA, XDS - must Serve at the end, but before 'wait'
-	go func() {
-		if s.GRPCListener == nil {
-			return // listener is off - using handler
-		}
-		if !s.waitForCacheSync(stop) {
-			return
-		}
-		log.Infof("starting gRPC discovery service at %s", s.GRPCListener.Addr())
-		if err := s.grpcServer.Serve(s.GRPCListener); err != nil {
-			log.Warn(err)
-		}
-	}()
-
-	if !s.waitForCacheSync(stop) {
-		return fmt.Errorf("failed to sync cache")
+	if s.GRPCListener != nil {
+		go func() {
+			log.Infof("starting gRPC discovery service at %s", s.GRPCListener.Addr())
+			if err := s.grpcServer.Serve(s.GRPCListener); err != nil {
+				log.Errorf("error serving GRPC server: %v", err)
+			}
+		}()
 	}
-
-	// Inform Discovery Server so that it can start accepting connections.
-	s.XDSServer.CachesSynced()
 
 	// At this point we are ready - start Http Listener so that it can respond to readiness events.
 	go func() {
 		log.Infof("starting Http service at %s", s.HTTPListener.Addr())
-		if err := s.httpServer.Serve(s.HTTPListener); err != nil {
-			log.Warn(err)
+		if err := s.httpServer.Serve(s.HTTPListener); isUnexpectedListenerError(err) {
+			log.Errorf("error serving http server: %v", err)
 		}
 	}()
 
+	if s.HTTP2Listener != nil {
+		go func() {
+			log.Infof("starting Http2 muxed service at %s", s.HTTP2Listener.Addr())
+			h2s := &http2.Server{}
+			h1s := &http.Server{
+				Addr:    ":8080",
+				Handler: h2c.NewHandler(s.httpMux, h2s),
+			}
+			if err := h1s.Serve(s.HTTP2Listener); isUnexpectedListenerError(err) {
+				log.Errorf("error serving http server: %v", err)
+			}
+		}()
+	}
+
 	if s.httpsServer != nil {
 		go func() {
-			log.Infof("starting webhook service at %s", s.HTTPListener.Addr())
-			if err := s.httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-				log.Warn(err)
+			log.Infof("starting webhook service at %s", s.httpsServer.Addr)
+			if err := s.httpsServer.ListenAndServeTLS("", ""); isUnexpectedListenerError(err) {
+				log.Errorf("error serving https server: %v", err)
 			}
 		}()
 	}
@@ -412,7 +468,7 @@ func (s *Server) Start(stop <-chan struct{}) error {
 // WaitUntilCompletion waits for everything marked as a "required termination" to complete.
 // This should be called before exiting.
 func (s *Server) WaitUntilCompletion() {
-	s.requiredTerminations.Wait()
+	s.server.Wait()
 }
 
 // initSDSServer starts the SDS server
@@ -422,7 +478,8 @@ func (s *Server) initSDSServer(args *PilotArgs) {
 			// Make sure we have security
 			log.Warnf("skipping Kubernetes credential reader; PILOT_ENABLE_XDS_IDENTITY_CHECK must be set to true for this feature.")
 		} else {
-			sc := kubesecrets.NewMulticluster(s.kubeClient, s.clusterID, args.RegistryOptions.ClusterRegistriesNamespace)
+			// TODO move this to a startup function and pass stop
+			sc := kubesecrets.NewMulticluster(s.kubeClient, s.clusterID, args.RegistryOptions.ClusterRegistriesNamespace, make(chan struct{}))
 			sc.AddEventHandler(func(name, namespace string) {
 				s.XDSServer.ConfigUpdate(&model.PushRequest{
 					Full: false,
@@ -498,7 +555,6 @@ func (s *Server) istiodReadyHandler(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 	}
-	// TODO check readiness of other secure gRPC and HTTP servers.
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -524,8 +580,8 @@ func (s *Server) initIstiodAdminServer(args *PilotArgs, wh *inject.Webhook) erro
 		log.Info("initializing Istiod admin server")
 	}
 
-	whc := func() string {
-		return wh.Config.Template
+	whc := func() map[string]string {
+		return wh.Config.Templates
 	}
 
 	// Debug Server.
@@ -570,13 +626,13 @@ func (s *Server) initDiscoveryService(args *PilotArgs) {
 	} else if s.GRPCListener == nil {
 		// This happens only if the GRPC port (15010) is disabled. We will multiplex
 		// it on the HTTP port. Does not impact the HTTPS gRPC or HTTPS.
-		log.Info("multplexing gRPC on http port ", s.HTTPListener.Addr())
+		log.Info("multiplexing gRPC on http port ", s.HTTPListener.Addr())
 		m := cmux.New(s.HTTPListener)
 		s.GRPCListener = m.Match(cmux.HTTP2HeaderField("content-type", "application/grpc"))
+		s.HTTP2Listener = m.Match(cmux.HTTP2())
 		s.HTTPListener = m.Match(cmux.Any())
 		go func() {
-			err := m.Serve()
-			if err != nil {
+			if err := m.Serve(); isUnexpectedListenerError(err) {
 				log.Warnf("Failed to listen on multiplexed port %v", err)
 			}
 		}()
@@ -589,7 +645,6 @@ func (s *Server) waitForShutdown(stop <-chan struct{}) {
 	go func() {
 		<-stop
 		s.fileWatcher.Close()
-		model.GetJwtKeyResolver().Close()
 
 		// Stop gRPC services.  If gRPC services fail to stop in the shutdown duration,
 		// force stop them. This does not happen normally.
@@ -644,7 +699,11 @@ func (s *Server) initSecureDiscoveryService(args *PilotArgs) error {
 		return nil
 	}
 
-	if s.peerCertVerifier == nil {
+	peerCertVerifier, err := s.createPeerCertVerifier(args.ServerOptions.TLSOptions)
+	if err != nil {
+		return err
+	}
+	if peerCertVerifier == nil {
 		// Running locally without configured certs - no TLS mode
 		log.Warnf("The secure discovery service is disabled")
 		return nil
@@ -654,9 +713,9 @@ func (s *Server) initSecureDiscoveryService(args *PilotArgs) error {
 	cfg := &tls.Config{
 		GetCertificate: s.getIstiodCertificate,
 		ClientAuth:     tls.VerifyClientCertIfGiven,
-		ClientCAs:      s.peerCertVerifier.GetGeneralCertPool(),
+		ClientCAs:      peerCertVerifier.GetGeneralCertPool(),
 		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			err := s.peerCertVerifier.VerifyPeerCert(rawCerts, verifiedChains)
+			err := peerCertVerifier.VerifyPeerCert(rawCerts, verifiedChains)
 			if err != nil {
 				log.Infof("Could not verify certificate: %v", err)
 			}
@@ -665,9 +724,6 @@ func (s *Server) initSecureDiscoveryService(args *PilotArgs) error {
 	}
 
 	tlsCreds := credentials.NewTLS(cfg)
-
-	// Default is 15012 - istio-agent relies on this as a default to distinguish what cert auth to expect.
-	// TODO(ramaraochavali): clean up istio-agent startup to remove the dependency of "15012" port.
 
 	// create secure grpc listener
 	l, err := net.Listen("tcp", args.ServerOptions.SecureGRPCAddr)
@@ -728,8 +784,8 @@ func (s *Server) grpcServerOptions(options *istiokeepalive.Options) []grpc.Serve
 
 // addStartFunc appends a function to be run. These are run synchronously in order,
 // so the function should start a go routine if it needs to do anything blocking
-func (s *Server) addStartFunc(fn startFunc) {
-	s.startFuncs = append(s.startFuncs, fn)
+func (s *Server) addStartFunc(fn server.Component) {
+	s.server.RunComponent(fn)
 }
 
 // adds a readiness probe for Istiod Server.
@@ -737,29 +793,29 @@ func (s *Server) addReadinessProbe(name string, fn readinessProbe) {
 	s.readinessProbes[name] = fn
 }
 
-// addRequireStartFunc adds a function that should terminate before the serve shuts down
+// addTerminatingStartFunc adds a function that should terminate before the serve shuts down
 // This is useful to do cleanup activities
 // This is does not guarantee they will terminate gracefully - best effort only
 // Function should be synchronous; once it returns it is considered "done"
-func (s *Server) addTerminatingStartFunc(fn startFunc) {
-	s.addStartFunc(func(stop <-chan struct{}) error {
-		// We mark this as a required termination as an optimization. Without this, when we exit the lock is
-		// still held for some time (30-60s or so). If we allow time for a graceful exit, then we can immediately drop the lock.
-		s.requiredTerminations.Add(1)
-		go func() {
-			err := fn(stop)
-			if err != nil {
-				log.Errorf("failure in startup function: %v", err)
-			}
-			s.requiredTerminations.Done()
-		}()
-		return nil
-	})
+func (s *Server) addTerminatingStartFunc(fn server.Component) {
+	s.server.RunComponentAsyncAndWait(fn)
 }
 
 func (s *Server) waitForCacheSync(stop <-chan struct{}) bool {
 	if !cache.WaitForCacheSync(stop, s.cachesSynced) {
 		log.Errorf("Failed waiting for cache sync")
+		return false
+	}
+	// At this point, we know that all update events of the initial state-of-the-world have been
+	// received. Capture how many updates there are
+	expected := s.XDSServer.InboundUpdates.Load()
+	// Now, we wait to ensure we have committed at least this many updates. This avoids a race
+	// condition where we are marked ready prior to updating the push context, leading to incomplete
+	// pushes.
+	if !cache.WaitForCacheSync(stop, func() bool {
+		return s.XDSServer.CommittedUpdates.Load() >= expected
+	}) {
+		log.Errorf("Failed waiting for push context initialization")
 		return false
 	}
 
@@ -799,7 +855,7 @@ func (s *Server) initRegistryEventHandlers() {
 	s.ServiceController().AppendServiceHandler(serviceHandler)
 
 	if s.configController != nil {
-		configHandler := func(_, curr config.Config, event model.Event) {
+		configHandler := func(old config.Config, curr config.Config, event model.Event) {
 			pushReq := &model.PushRequest{
 				Full: true,
 				ConfigsUpdated: map[model.ConfigKey]struct{}{{
@@ -830,6 +886,10 @@ func (s *Server) initRegistryEventHandlers() {
 				Resource().GroupVersionKind() {
 				continue
 			}
+			if schema.Resource().GroupVersionKind() == collections.IstioNetworkingV1Alpha3Workloadgroups.
+				Resource().GroupVersionKind() {
+				continue
+			}
 
 			s.configController.RegisterEventHandler(schema.Resource().GroupVersionKind(), configHandler)
 		}
@@ -852,14 +912,19 @@ func (s *Server) initIstiodCerts(args *PilotArgs, host string) error {
 
 // maybeInitDNSCerts initializes DNS certs if needed.
 func (s *Server) maybeInitDNSCerts(args *PilotArgs, host string) error {
-	// Generate DNS certificates only if custom certs are not provided via args.
-	if !hasCustomTLSCerts(args.ServerOptions.TLSOptions) && s.EnableCA() {
-		// Create DNS certificates. This allows injector, validation to work without Citadel, and
+	if hasCustomTLSCerts(args.ServerOptions.TLSOptions) {
+		// Use the DNS certificate provided via args.
+		// This allows injector, validation to work without Citadel, and
 		// allows secure SDS connections to Istiod.
-		log.Infof("initializing Istiod DNS certificates host: %s, custom host: %s", host, features.IstiodServiceCustomHost.Get())
-		if err := s.initDNSCerts(host, features.IstiodServiceCustomHost.Get(), args.Namespace); err != nil {
-			return err
-		}
+		return nil
+	}
+	if !s.EnableCA() && features.PilotCertProvider.Get() == IstiodCAProvider {
+		// If CA functionality is disabled, istiod cannot sign the DNS certificates.
+		return nil
+	}
+	log.Infof("initializing Istiod DNS certificates host: %s, custom host: %s", host, features.IstiodServiceCustomHost.Get())
+	if err := s.initDNSCerts(host, features.IstiodServiceCustomHost.Get(), args.Namespace); err != nil {
+		return err
 	}
 	return nil
 }
@@ -954,18 +1019,18 @@ func (s *Server) getCertKeyPaths(tlsOptions TLSOptions) (string, string) {
 	return key, cert
 }
 
-// setPeerCertVerifier sets up a SPIFFE certificate verifier with the current istiod configuration.
-func (s *Server) setPeerCertVerifier(tlsOptions TLSOptions) error {
+// createPeerCertVerifier creates a SPIFFE certificate verifier with the current istiod configuration.
+func (s *Server) createPeerCertVerifier(tlsOptions TLSOptions) (*spiffe.PeerCertVerifier, error) {
 	if tlsOptions.CaCertFile == "" && s.CA == nil && features.SpiffeBundleEndpoints == "" {
 		// Running locally without configured certs - no TLS mode
-		return nil
+		return nil, nil
 	}
-	s.peerCertVerifier = spiffe.NewPeerCertVerifier()
+	peerCertVerifier := spiffe.NewPeerCertVerifier()
 	var rootCertBytes []byte
 	var err error
 	if tlsOptions.CaCertFile != "" {
 		if rootCertBytes, err = ioutil.ReadFile(tlsOptions.CaCertFile); err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		if s.RA != nil {
@@ -977,10 +1042,9 @@ func (s *Server) setPeerCertVerifier(tlsOptions TLSOptions) error {
 	}
 
 	if len(rootCertBytes) != 0 {
-		err := s.peerCertVerifier.AddMappingFromPEM(spiffe.GetTrustDomain(), rootCertBytes)
+		err := peerCertVerifier.AddMappingFromPEM(spiffe.GetTrustDomain(), rootCertBytes)
 		if err != nil {
-			log.Errorf("Add Root CAs into peerCertVerifier failed: %v", err)
-			return fmt.Errorf("add root CAs into peerCertVerifier failed: %v", err)
+			return nil, fmt.Errorf("add root CAs into peerCertVerifier failed: %v", err)
 		}
 	}
 
@@ -988,12 +1052,12 @@ func (s *Server) setPeerCertVerifier(tlsOptions TLSOptions) error {
 		certMap, err := spiffe.RetrieveSpiffeBundleRootCertsFromStringInput(
 			features.SpiffeBundleEndpoints, []*x509.Certificate{})
 		if err != nil {
-			return err
+			return nil, err
 		}
-		s.peerCertVerifier.AddMappings(certMap)
+		peerCertVerifier.AddMappings(certMap)
 	}
 
-	return nil
+	return peerCertVerifier, nil
 }
 
 // hasCustomTLSCerts returns true if custom TLS certificates are configured via args.
@@ -1003,8 +1067,8 @@ func hasCustomTLSCerts(tlsOptions TLSOptions) bool {
 
 // getIstiodCertificate returns the istiod certificate.
 func (s *Server) getIstiodCertificate(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	s.certMu.Lock()
-	defer s.certMu.Unlock()
+	s.certMu.RLock()
+	defer s.certMu.RUnlock()
 	return s.istiodCert, nil
 }
 
@@ -1023,22 +1087,6 @@ func (s *Server) initControllers(args *PilotArgs) error {
 		return fmt.Errorf("error initializing service controllers: %v", err)
 	}
 	return nil
-}
-
-// initJwtPolicy initializes JwtPolicy.
-func (s *Server) initJwtPolicy() {
-	if features.JwtPolicy.Get() != jwt.PolicyThirdParty {
-		log.Info("JWT policy is ", features.JwtPolicy.Get())
-	}
-
-	switch features.JwtPolicy.Get() {
-	case jwt.PolicyThirdParty:
-		s.jwtPath = ThirdPartyJWTPath
-	case jwt.PolicyFirstParty:
-		s.jwtPath = securityModel.K8sSAJwtFileName
-	default:
-		log.Infof("unknown JWT policy %v, default to certificates ", features.JwtPolicy.Get())
-	}
 }
 
 // maybeCreateCA creates and initializes CA Key if needed.
@@ -1123,4 +1171,71 @@ func (s *Server) initMeshHandlers() {
 			Reason: []model.TriggerReason{model.GlobalUpdate},
 		})
 	})
+}
+
+func (s *Server) addIstioCAToTrustBundle(args *PilotArgs) error {
+	var err error
+	if s.CA != nil {
+		// If IstioCA is setup, derive trustAnchor directly from CA
+		rootCerts := []string{string(s.CA.GetCAKeyCertBundle().GetRootCertPem())}
+		err = s.workloadTrustBundle.UpdateTrustAnchor(&tb.TrustAnchorUpdate{
+			TrustAnchorConfig: tb.TrustAnchorConfig{Certs: rootCerts},
+			Source:            tb.SourceIstioCA,
+		})
+		if err != nil {
+			log.Errorf("unable to add CA root from namespace %s as trustAnchor", args.Namespace)
+			return err
+		}
+		return nil
+	}
+	return nil
+}
+
+func (s *Server) initWorkloadTrustBundle(args *PilotArgs) error {
+	var err error
+
+	s.workloadTrustBundle.UpdateCb(func() {
+		pushReq := &model.PushRequest{
+			Full:   true,
+			Reason: []model.TriggerReason{model.GlobalUpdate},
+		}
+		s.XDSServer.ConfigUpdate(pushReq)
+	})
+
+	s.addStartFunc(func(stop <-chan struct{}) error {
+		go s.workloadTrustBundle.ProcessRemoteTrustAnchors(stop, tb.RemoteDefaultPollPeriod)
+		return nil
+	})
+
+	// MeshConfig: Add initial roots
+	err = s.workloadTrustBundle.AddMeshConfigUpdate(s.environment.Mesh())
+	if err != nil {
+		return err
+	}
+
+	// MeshConfig:Add callback for mesh config update
+	s.environment.AddMeshHandler(func() {
+		_ = s.workloadTrustBundle.AddMeshConfigUpdate(s.environment.Mesh())
+	})
+
+	err = s.addIstioCAToTrustBundle(args)
+	if err != nil {
+		return err
+	}
+
+	// IstioRA: Explicitly add roots corresponding to RA
+	if s.RA != nil {
+		// Implicitly add the Istio RA certificates to the Workload Trust Bundle
+		rootCerts := []string{string(s.RA.GetCAKeyCertBundle().GetRootCertPem())}
+		err = s.workloadTrustBundle.UpdateTrustAnchor(&tb.TrustAnchorUpdate{
+			TrustAnchorConfig: tb.TrustAnchorConfig{Certs: rootCerts},
+			Source:            tb.SourceIstioRA,
+		})
+		if err != nil {
+			log.Errorf("fatal: unable to add RA root as trustAnchor")
+			return err
+		}
+	}
+	log.Infof("done initializing workload trustBundle")
+	return nil
 }

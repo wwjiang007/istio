@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/reflection"
 
 	"istio.io/istio/pkg/test/echo/common"
@@ -157,10 +158,17 @@ func (h *grpcHandler) Echo(ctx context.Context, req *proto.EchoRequest) (*proto.
 		portNumber = h.Port.Port
 	}
 
+	ip := "0.0.0.0"
+	if peerInfo, ok := peer.FromContext(ctx); ok {
+		ip, _, _ = net.SplitHostPort(peerInfo.Addr.String())
+	}
+
 	writeField(&body, response.StatusCodeField, response.StatusCodeOK)
 	writeField(&body, response.ServiceVersionField, h.Version)
 	writeField(&body, response.ServicePortField, strconv.Itoa(portNumber))
 	writeField(&body, response.ClusterField, h.Cluster)
+	writeField(&body, response.IPField, ip)
+	writeField(&body, response.IstioVersionField, h.IstioVersion)
 	writeField(&body, "Echo", req.GetMessage())
 
 	if hostname, err := os.Hostname(); err == nil {
@@ -176,7 +184,6 @@ func (h *grpcHandler) ForwardEcho(ctx context.Context, req *proto.ForwardEchoReq
 	instance, err := forwarder.New(forwarder.Config{
 		Request: req,
 		Dialer:  h.Dialer,
-		TLSCert: h.TLSCert,
 	})
 	if err != nil {
 		return nil, err

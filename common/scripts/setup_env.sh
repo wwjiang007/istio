@@ -38,6 +38,8 @@ elif [[ ${LOCAL_ARCH} == armv* ]]; then
     export TARGET_ARCH=arm
 elif [[ ${LOCAL_ARCH} == s390x ]]; then
 ￼    export TARGET_ARCH=s390x
+elif [[ ${LOCAL_ARCH} == ppc64le ]]; then
+    export TARGET_ARCH=ppc64le
 else
     echo "This system's architecture, ${LOCAL_ARCH}, isn't supported"
     exit 1
@@ -61,7 +63,7 @@ fi
 
 # Build image to use
 if [[ "${IMAGE_VERSION:-}" == "" ]]; then
-  export IMAGE_VERSION=master-2020-11-12T22-29-05
+  export IMAGE_VERSION=master-2021-03-15T07-16-03
 fi
 if [[ "${IMAGE_NAME:-}" == "" ]]; then
   export IMAGE_NAME=build-tools

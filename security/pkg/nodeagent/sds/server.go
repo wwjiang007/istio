@@ -15,23 +15,18 @@
 package sds
 
 import (
-	"context"
 	"net"
-	"net/http"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
-	ca2 "istio.io/istio/pkg/security"
+	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/uds"
-	"istio.io/istio/security/pkg/nodeagent/plugin"
-	"istio.io/istio/security/pkg/nodeagent/plugin/providers/google/stsclient"
-	"istio.io/pkg/version"
 )
 
 const (
-	// base HTTP route for debug endpoints
 	maxStreams    = 100000
 	maxRetryTimes = 5
 )
@@ -43,25 +38,27 @@ type Server struct {
 	grpcWorkloadListener net.Listener
 
 	grpcWorkloadServer *grpc.Server
-	debugServer        *http.Server
 }
 
 // NewServer creates and starts the Grpc server for SDS.
-func NewServer(options *ca2.Options, workloadSecretCache ca2.SecretManager) (*Server, error) {
-	s := &Server{
-		workloadSds: newSDSService(workloadSecretCache, options, options.FileMountedCerts),
-	}
-	if options.EnableWorkloadSDS {
-		if err := s.initWorkloadSdsService(options); err != nil {
-			sdsServiceLog.Errorf("Failed to initialize secret discovery service for workload proxies: %v", err)
-			return nil, err
-		}
-		sdsServiceLog.Infof("SDS gRPC server for workload UDS starts, listening on %q", options.WorkloadUDSPath)
-	}
-
-	version.Info.RecordComponentBuildTag("citadel_agent")
-
+func NewServer(options *security.Options, workloadSecretCache security.SecretManager) (*Server, error) {
+	s := &Server{}
+	s.workloadSds = newSDSService(workloadSecretCache, options)
+	s.initWorkloadSdsService(options)
+	sdsServiceLog.Infof("SDS server for workload certificates started, listening on %q", options.WorkloadUDSPath)
 	return s, nil
+}
+
+func (s *Server) UpdateCallback(resourceName string) {
+	if s.workloadSds == nil {
+		return
+	}
+	s.workloadSds.XdsServer.Push(&model.PushRequest{
+		Full: false,
+		ConfigsUpdated: map[model.ConfigKey]struct{}{
+			{Kind: gvk.Secret, Name: resourceName}: {},
+		},
+	})
 }
 
 // Stop closes the gRPC server and debug server.
@@ -70,42 +67,19 @@ func (s *Server) Stop() {
 		return
 	}
 
+	if s.grpcWorkloadServer != nil {
+		s.grpcWorkloadServer.Stop()
+	}
 	if s.grpcWorkloadListener != nil {
 		s.grpcWorkloadListener.Close()
 	}
-	if s.grpcWorkloadServer != nil {
-		s.workloadSds.Stop()
-		s.grpcWorkloadServer.Stop()
-	}
-
-	if s.debugServer != nil {
-		if err := s.debugServer.Shutdown(context.TODO()); err != nil {
-			sdsServiceLog.Error("failed to shut down debug server")
-		}
+	if s.workloadSds != nil {
+		s.workloadSds.Close()
 	}
 }
 
-// NewPlugins returns a slice of default Plugins.
-func NewPlugins(in []string) []ca2.TokenExchanger {
-	var availablePlugins = map[string]ca2.TokenExchanger{
-		plugin.GoogleTokenExchange: stsclient.NewPlugin(),
-	}
-	var plugins []ca2.TokenExchanger
-	for _, pl := range in {
-		if p, exist := availablePlugins[pl]; exist {
-			plugins = append(plugins, p)
-		}
-	}
-	return plugins
-}
-
-func (s *Server) initWorkloadSdsService(options *ca2.Options) error { //nolint: unparam
-	if options.GrpcServer != nil {
-		s.grpcWorkloadServer = options.GrpcServer
-		s.workloadSds.register(s.grpcWorkloadServer)
-		return nil
-	}
-	s.grpcWorkloadServer = grpc.NewServer(s.grpcServerOptions(options)...)
+func (s *Server) initWorkloadSdsService(options *security.Options) {
+	s.grpcWorkloadServer = grpc.NewServer(s.grpcServerOptions()...)
 	s.workloadSds.register(s.grpcWorkloadServer)
 
 	var err error
@@ -140,22 +114,11 @@ func (s *Server) initWorkloadSdsService(options *ca2.Options) error { //nolint: 
 			waitTime *= 2
 		}
 	}()
-
-	return nil
 }
 
-func (s *Server) grpcServerOptions(options *ca2.Options) []grpc.ServerOption {
+func (s *Server) grpcServerOptions() []grpc.ServerOption {
 	grpcOptions := []grpc.ServerOption{
 		grpc.MaxConcurrentStreams(uint32(maxStreams)),
-	}
-
-	if options.CertFile != "" && options.KeyFile != "" {
-		creds, err := credentials.NewServerTLSFromFile(options.CertFile, options.KeyFile)
-		if err != nil {
-			sdsServiceLog.Errorf("Failed to load TLS keys: %s", err)
-			return nil
-		}
-		grpcOptions = append(grpcOptions, grpc.Creds(creds))
 	}
 
 	return grpcOptions

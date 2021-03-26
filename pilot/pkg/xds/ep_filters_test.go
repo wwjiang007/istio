@@ -53,13 +53,13 @@ var expectedMetadata = &structpb.Struct{
 }
 
 func TestEndpointsByNetworkFilter(t *testing.T) {
-
 	// Environment defines the networks with:
 	//  - 1 gateway for network1
 	//  - 2 gateway for network2
 	//  - 1 gateway for network3
 	//  - 0 gateways for network4
 	env := environment()
+	env.Init()
 
 	// Test endpoints creates:
 	//  - 2 endpoints in network1
@@ -230,6 +230,7 @@ func TestEndpointsByNetworkFilter_SkipLBWithHostname(t *testing.T) {
 	serviceDiscovery.SetGatewaysForNetwork("network2", &model.Gateway{Addr: "aeiou.scooby.do", Port: 80})
 
 	env.ServiceDiscovery = serviceDiscovery
+	env.Init()
 
 	// Test endpoints creates:
 	//  - 2 endpoints in network1

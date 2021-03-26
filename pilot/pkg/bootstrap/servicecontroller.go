@@ -74,6 +74,7 @@ func (s *Server) initKubeRegistry(args *PilotArgs) (err error) {
 	args.RegistryOptions.KubeOptions.Metrics = s.environment
 	args.RegistryOptions.KubeOptions.XDSUpdater = s.XDSServer
 	args.RegistryOptions.KubeOptions.NetworksWatcher = s.environment.NetworksWatcher
+	args.RegistryOptions.KubeOptions.MeshWatcher = s.environment.Watcher
 	args.RegistryOptions.KubeOptions.SystemNamespace = args.Namespace
 
 	caBundlePath := s.caBundlePath
@@ -88,14 +89,20 @@ func (s *Server) initKubeRegistry(args *PilotArgs) (err error) {
 		s.ServiceController(),
 		s.serviceEntryStore,
 		caBundlePath,
+		args.Revision,
 		s.fetchCARoot,
-		s.environment)
+		s.environment,
+		s.environment.ClusterLocal(),
+		s.server)
 
 	// initialize the "main" cluster registry before starting controllers for remote clusters
 	if err := mc.AddMemberCluster(s.kubeClient, args.RegistryOptions.KubeOptions.ClusterID); err != nil {
 		log.Errorf("failed initializing registry for %s: %v", args.RegistryOptions.KubeOptions.ClusterID, err)
 		return err
 	}
+
+	// Start the multicluster controller and wait for it to shutdown before exiting the server.
+	s.addTerminatingStartFunc(mc.Run)
 
 	// start remote cluster controllers
 	s.addStartFunc(func(stop <-chan struct{}) error {

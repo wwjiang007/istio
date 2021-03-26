@@ -81,7 +81,7 @@ func (q *pq) Peek() interface{} {
 	return (*q)[0]
 }
 
-// Delayed ipmlements queue such that tasks are executed after a specified delay.
+// Delayed implements queue such that tasks are executed after a specified delay.
 type Delayed interface {
 	Instance
 	PushDelayed(t Task, delay time.Duration)
@@ -117,13 +117,17 @@ var workerChanBuf = func() int {
 	// Use blocking channel if GOMAXPROCS=1.
 	// This switches context from sender to receiver immediately,
 	// which results in higher performance.
-	if runtime.GOMAXPROCS(0) == 1 {
+	var n int
+	if n = runtime.GOMAXPROCS(0); n == 1 {
 		return 0
 	}
 
-	// Use non-blocking workerChan if GOMAXPROCS>1,
-	// since otherwise the sender might be dragged down if the receiver is CPU-bound.
-	return 1
+	// Make channel non-blocking and set up its capacity with GOMAXPROCS if GOMAXPROCS>1,
+	// otherwise the sender might be dragged down if the receiver is CPU-bound.
+	//
+	// GOMAXPROCS determines how many goroutines can run in parallel,
+	// which makes it the best choice as the channel capacity,
+	return n
 }()
 
 // NewDelayed gives a Delayed queue with maximum concurrency specified by workers.
@@ -213,7 +217,9 @@ func (d *delayQueue) Run(stop <-chan struct{}) {
 			// no items, wait for Push or stop
 			select {
 			case t := <-d.enqueue:
+				d.mu.Lock()
 				d.queue.Push(t)
+				d.mu.Unlock()
 			case <-stop:
 				return
 			}

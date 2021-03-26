@@ -19,6 +19,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/fatih/color"
+	"github.com/ghodss/yaml"
+	admit_v1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	v1batch "k8s.io/api/batch/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,22 +33,23 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"istio.io/api/label"
 	"istio.io/istio/istioctl/pkg/clioptions"
 	operator_istio "istio.io/istio/operator/pkg/apis/istio"
 	"istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/operator/pkg/controlplane"
+	"istio.io/istio/operator/pkg/manifest"
 	"istio.io/istio/operator/pkg/translate"
 	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/operator/pkg/util/clog"
+	"istio.io/istio/pkg/kube"
 )
 
-var (
-	istioOperatorGVR = apimachinery_schema.GroupVersionResource{
-		Group:    v1alpha1.SchemeGroupVersion.Group,
-		Version:  v1alpha1.SchemeGroupVersion.Version,
-		Resource: "istiooperators",
-	}
-)
+var istioOperatorGVR = apimachinery_schema.GroupVersionResource{
+	Group:    v1alpha1.SchemeGroupVersion.Group,
+	Version:  v1alpha1.SchemeGroupVersion.Version,
+	Resource: "istiooperators",
+}
 
 // StatusVerifier checks status of certain resources like deployment,
 // jobs and also verifies count of certain resource types.
@@ -58,6 +62,8 @@ type StatusVerifier struct {
 	controlPlaneOpts clioptions.ControlPlaneOptions
 	logger           clog.Logger
 	iop              *v1alpha1.IstioOperator
+	successMarker    string
+	failureMarker    string
 }
 
 // NewStatusVerifier creates a new instance of post-install verifier
@@ -78,7 +84,14 @@ func NewStatusVerifier(istioNamespace, manifestsPath, kubeconfig, context string
 		kubeconfig:       kubeconfig,
 		context:          context,
 		iop:              installedIOP,
+		successMarker:    "✔",
+		failureMarker:    "✘",
 	}
+}
+
+func (v *StatusVerifier) Colorize() {
+	v.successMarker = color.New(color.FgGreen).Sprint(v.successMarker)
+	v.failureMarker = color.New(color.FgRed).Sprint(v.failureMarker)
 }
 
 // Verify implements Verifier interface. Here we check status of deployment
@@ -94,16 +107,86 @@ func (v *StatusVerifier) Verify() error {
 }
 
 func (v *StatusVerifier) verifyInstallIOPRevision() error {
+	var err error
+	if v.controlPlaneOpts.Revision == "" {
+		v.controlPlaneOpts.Revision, err = v.getRevision()
+		if err != nil {
+			return err
+		}
+	}
 	iop, err := v.operatorFromCluster(v.controlPlaneOpts.Revision)
 	if err != nil {
-		return fmt.Errorf("could not load IstioOperator from cluster: %v.  Use --filename", err)
+		// At this point we know there is no IstioOperator defining a control plane.  This may
+		// be the case in a Istio cluster with external control plane.
+		v.logger.LogAndErrorf("error while fetching revision %s: %v", v.controlPlaneOpts.Revision, err.Error())
+		injector, err2 := v.injectorFromCluster(v.controlPlaneOpts.Revision)
+		if err2 == nil && injector != nil {
+			// The cluster *is* configured for Istio, but no IOP is present.  This could mean
+			// - the user followed our remote control plane instructions
+			// - helm was used
+			// - user did `istioctl manifest generate | kubectl apply ...`
+			// nolint: golint,stylecheck
+			return fmt.Errorf("Istio present but verify-install needs an IstioOperator or manifest for comparison. Supply flag --filename <yaml>")
+		}
+		return fmt.Errorf("could not load IstioOperator from cluster: %v. Use --filename", err)
 	}
 	if v.manifestsPath != "" {
 		iop.Spec.InstallPackagePath = v.manifestsPath
 	}
+	profile := manifest.GetProfile(iop)
+	by, err := yaml.Marshal(iop)
+	if err != nil {
+		return err
+	}
+	mergedIOP, err := manifest.GetMergedIOP(string(by), profile, v.manifestsPath, v.controlPlaneOpts.Revision,
+		v.kubeconfig, v.context, v.logger)
+	if err != nil {
+		return nil
+	}
 	crdCount, istioDeploymentCount, err := v.verifyPostInstallIstioOperator(
-		iop, fmt.Sprintf("in cluster operator %s", iop.GetName()))
+		mergedIOP, fmt.Sprintf("in cluster operator %s", mergedIOP.GetName()))
 	return v.reportStatus(crdCount, istioDeploymentCount, err)
+}
+
+func (v *StatusVerifier) getRevision() (string, error) {
+	var revision string
+	var revs string
+	revCount := 0
+	kubeClient, err := v.createClient()
+	if err != nil {
+		return "", err
+	}
+	pods, err := kubeClient.PodsForSelector(context.TODO(), v.istioNamespace, "app=istiod")
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch istiod pod, error: %v", err)
+	}
+	for _, pod := range pods.Items {
+		rev := pod.ObjectMeta.GetLabels()[label.IoIstioRev.Name]
+		revCount++
+		if rev == "default" {
+			continue
+		}
+		revision = rev
+	}
+	if revision == "" {
+		revs = "default"
+	} else {
+		revs = revision
+	}
+	v.logger.LogAndPrintf("%d Istio control planes detected, checking --revision %q only", revCount, revs)
+	return revision, nil
+}
+
+func (v *StatusVerifier) createClient() (kube.ExtendedClient, error) {
+	cfg, err := kube.BuildClientConfig(v.kubeconfig, v.context)
+	if err != nil {
+		return nil, err
+	}
+	kubeClient, err := kube.NewExtendedClient(kube.NewClientConfigForRestConfig(cfg), "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect Kubernetes API server, error: %v", err)
+	}
+	return kubeClient, nil
 }
 
 func (v *StatusVerifier) verifyFinalIOP() error {
@@ -144,7 +227,7 @@ func (v *StatusVerifier) verifyPostInstallIstioOperator(iop *v1alpha1.IstioOpera
 		return 0, 0, errs.ToError()
 	}
 
-	builder := resource.NewBuilder(v.k8sConfig()).Unstructured()
+	builder := resource.NewBuilder(v.k8sConfig()).ContinueOnError().Unstructured()
 	for cat, manifest := range manifests {
 		for i, manitem := range manifest {
 			reader := strings.NewReader(manitem)
@@ -188,7 +271,7 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 			kinds = strings.ToLower(kind) + "s"
 		}
 		if namespace == "" {
-			namespace = "default"
+			namespace = v.istioNamespace
 		}
 		switch kind {
 		case "Deployment":
@@ -202,10 +285,13 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 				Do(context.TODO()).
 				Into(deployment)
 			if err != nil {
+				v.reportFailure(kind, name, namespace, err)
 				return err
 			}
 			if err = verifyDeploymentStatus(deployment); err != nil {
-				return istioVerificationFailureError(filename, err)
+				ivf := istioVerificationFailureError(filename, err)
+				v.reportFailure(kind, name, namespace, ivf)
+				return ivf
 			}
 			if namespace == v.istioNamespace && strings.HasPrefix(name, "istio") {
 				istioDeploymentCount++
@@ -221,10 +307,13 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 				Do(context.TODO()).
 				Into(job)
 			if err != nil {
+				v.reportFailure(kind, name, namespace, err)
 				return err
 			}
 			if err := verifyJobPostInstall(job); err != nil {
-				return istioVerificationFailureError(filename, err)
+				ivf := istioVerificationFailureError(filename, err)
+				v.reportFailure(kind, name, namespace, ivf)
+				return ivf
 			}
 		case "IstioOperator":
 			// It is not a problem if the cluster does not include the IstioOperator
@@ -235,20 +324,32 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 			// usual conversion not available.  Convert unstructured to string
 			// and ask operator code to unmarshal.
 			fixTimestampRelatedUnmarshalIssues(un)
+
 			by := util.ToYAML(un)
-			iop, err := operator_istio.UnmarshalIstioOperator(by, true)
+			unmergedIOP, err := operator_istio.UnmarshalIstioOperator(by, true)
 			if err != nil {
+				v.reportFailure(kind, name, namespace, err)
+				return err
+			}
+			profile := manifest.GetProfile(unmergedIOP)
+			iop, err := manifest.GetMergedIOP(by, profile, v.manifestsPath, v.controlPlaneOpts.Revision,
+				v.kubeconfig, v.context, v.logger)
+			if err != nil {
+				v.reportFailure(kind, name, namespace, err)
 				return err
 			}
 			if v.manifestsPath != "" {
 				iop.Spec.InstallPackagePath = v.manifestsPath
 			}
+			if v1alpha1.Namespace(iop.Spec) == "" {
+				v1alpha1.SetNamespace(iop.Spec, v.istioNamespace)
+			}
 			generatedCrds, generatedDeployments, err := v.verifyPostInstallIstioOperator(iop, filename)
+			crdCount += generatedCrds
+			istioDeploymentCount += generatedDeployments
 			if err != nil {
 				return err
 			}
-			crdCount += generatedCrds
-			istioDeploymentCount += generatedDeployments
 		default:
 			result := info.Client.
 				Get().
@@ -263,6 +364,7 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 					Name(name).
 					Do(context.TODO())
 				if result.Error() != nil {
+					v.reportFailure(kind, name, namespace, result.Error())
 					return istioVerificationFailureError(filename,
 						fmt.Errorf("the required %s:%s is not ready due to: %v",
 							kind, name, result.Error()))
@@ -272,10 +374,43 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 				crdCount++
 			}
 		}
-		v.logger.LogAndPrintf("✔ %s: %s.%s checked successfully", kind, name, namespace)
+		v.logger.LogAndPrintf("%s %s: %s.%s checked successfully", v.successMarker, kind, name, namespace)
 		return nil
 	})
 	return crdCount, istioDeploymentCount, err
+}
+
+// Find Istio injector matching revision.  ("" matches any revision.)
+func (v *StatusVerifier) injectorFromCluster(revision string) (*admit_v1.MutatingWebhookConfiguration, error) {
+	kubeClient, err := v.createClient()
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	hooks, err := kubeClient.AdmissionregistrationV1().MutatingWebhookConfigurations().List(ctx, meta_v1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	revCount := 0
+	var hookmatch *admit_v1.MutatingWebhookConfiguration
+	for _, hook := range hooks.Items {
+		rev := hook.ObjectMeta.GetLabels()[label.IoIstioRev.Name]
+		if rev != "" {
+			revCount++
+			revision = rev
+			if revision == "" || revision == rev {
+				hookmatch = &hook
+			}
+		}
+	}
+
+	v.logger.LogAndPrintf("%d Istio injectors detected", revCount)
+	if hookmatch != nil {
+		return hookmatch, nil
+	}
+
+	return nil, fmt.Errorf("Istio injector revision %q not found", revision) // nolint: golint,stylecheck
 }
 
 // Find an IstioOperator matching revision in the cluster.  The IstioOperators
@@ -294,7 +429,9 @@ func (v *StatusVerifier) operatorFromCluster(revision string) (*v1alpha1.IstioOp
 		return nil, err
 	}
 	for _, iop := range iops {
-		if iop.Spec.Revision == revision {
+		if iop.Spec.Revision == revision ||
+			(iop.Spec.Revision == "default" && revision == "") ||
+			(iop.Spec.Revision == "" && revision == "default") {
 			return iop, nil
 		}
 	}
@@ -302,16 +439,21 @@ func (v *StatusVerifier) operatorFromCluster(revision string) (*v1alpha1.IstioOp
 }
 
 func (v *StatusVerifier) reportStatus(crdCount, istioDeploymentCount int, err error) error {
-	if err != nil {
-		return err
-	}
 	v.logger.LogAndPrintf("Checked %v custom resource definitions", crdCount)
 	v.logger.LogAndPrintf("Checked %v Istio Deployments", istioDeploymentCount)
 	if istioDeploymentCount == 0 {
-		v.logger.LogAndPrintf("! No Istio installation found")
+		if err != nil {
+			v.logger.LogAndPrintf("! No Istio installation found: %v", err)
+		} else {
+			v.logger.LogAndPrintf("! No Istio installation found")
+		}
 		return fmt.Errorf("no Istio installation found")
 	}
-	v.logger.LogAndPrintf("✔ Istio is installed and verified successfully")
+	if err != nil {
+		// Don't return full error; it is usually an unwieldy aggregate
+		return fmt.Errorf("Istio installation failed") // nolint
+	}
+	v.logger.LogAndPrintf("%s Istio is installed and verified successfully", v.successMarker)
 	return nil
 }
 
@@ -346,9 +488,13 @@ func AllOperatorsInCluster(client dynamic.Interface) ([]*v1alpha1.IstioOperator,
 }
 
 func istioVerificationFailureError(filename string, reason error) error {
-	return fmt.Errorf("istio installation failed, incomplete or does not match \"%s\": %v", filename, reason)
+	return fmt.Errorf("Istio installation failed, incomplete or does not match \"%s\": %v", filename, reason) // nolint
 }
 
 func (v *StatusVerifier) k8sConfig() *genericclioptions.ConfigFlags {
 	return &genericclioptions.ConfigFlags{KubeConfig: &v.kubeconfig, Context: &v.context}
+}
+
+func (v *StatusVerifier) reportFailure(kind, name, namespace string, err error) {
+	v.logger.LogAndPrintf("%s %s: %s.%s: %v", v.failureMarker, kind, name, namespace, err)
 }
