@@ -84,11 +84,14 @@ The 'remove-from-mesh' command can be used to restart with the sidecar removed.`
   # Control how meshed pods see an external service
   istioctl experimental add-to-mesh external-service vmhttp 172.12.23.125,172.12.23.126 \
    http:9080 tcp:8888 --labels app=test,version=v1 --annotations env=stage --serviceaccount stageAdmin`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cmd.HelpFunc()(cmd, args)
+		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) != 0 {
 				return fmt.Errorf("unknown resource type %q", args[0])
 			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.HelpFunc()(cmd, args)
 			return nil
 		},
 	}
@@ -246,7 +249,7 @@ func externalSvcMeshifyCmd() *cobra.Command {
 		Use:     "external-service <svcname> <ip> [name1:]port1 [[name2:]port2] ...",
 		Aliases: []string{"es"},
 		Short:   "Add external service (e.g. services running on a VM) to Istio service mesh",
-		Long: `istioctl experimental add-to-mesh external-service create a ServiceEntry and
+		Long: `istioctl experimental add-to-mesh external-service create a ServiceEntry and 
 a Service without selector for the specified external service in Istio service mesh.
 The typical usage scenario is Mesh Expansion on VMs.
 
@@ -289,6 +292,7 @@ See also 'istioctl experimental remove-from-mesh external-service' which does th
 func setupParameters(sidecarTemplate *inject.Templates, valuesConfig *string, revision string) (*meshconfig.MeshConfig, error) {
 	var meshConfig *meshconfig.MeshConfig
 	var err error
+	injectConfigMapName = defaultInjectWebhookConfigName
 	if meshConfigFile != "" {
 		if meshConfig, err = mesh.ReadMeshConfig(meshConfigFile); err != nil {
 			return nil, err
@@ -328,7 +332,7 @@ func injectSideCarIntoDeployment(client kubernetes.Interface, dep *appsv1.Deploy
 	var errs error
 	log.Debugf("updating deployment %s.%s with Istio sidecar injected",
 		dep.Name, dep.Namespace)
-	newDep, err := inject.IntoObject(sidecarTemplate, valuesConfig, revision, meshConfig, dep, warningHandler)
+	newDep, err := inject.IntoObject(nil, sidecarTemplate, valuesConfig, revision, meshConfig, dep, warningHandler)
 	if err != nil {
 		errs = multierror.Append(errs, fmt.Errorf("failed to inject sidecar to deployment resource %s.%s for service %s.%s due to %v",
 			dep.Name, dep.Namespace, svcName, svcNamespace, err))

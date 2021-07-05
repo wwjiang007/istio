@@ -24,7 +24,6 @@ import (
 	"istio.io/istio/security/pkg/monitoring"
 	"istio.io/istio/security/pkg/nodeagent/util"
 	"istio.io/istio/security/pkg/stsservice/tokenmanager/google/mock"
-	"istio.io/istio/tests/util/leak"
 )
 
 func TestGetFederatedToken(t *testing.T) {
@@ -36,12 +35,12 @@ func TestGetFederatedToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start a mock server: %v", err)
 	}
-	SecureTokenEndpoint = ms.URL + "/v1/identitybindingtoken"
+	SecureTokenEndpoint = ms.URL + "/v1/token"
 	t.Cleanup(func() {
 		if err := ms.Stop(); err != nil {
 			t.Logf("failed to stop mock server: %v", err)
 		}
-		SecureTokenEndpoint = "https://securetoken.googleapis.com/v1/identitybindingtoken"
+		SecureTokenEndpoint = "https://sts.googleapis.com/v1/token"
 	})
 
 	t.Run("exchange", func(t *testing.T) {
@@ -85,8 +84,4 @@ func TestGetFederatedToken(t *testing.T) {
 			return nil
 		}, retry.Timeout(time.Second*5))
 	})
-}
-
-func TestMain(m *testing.M) {
-	leak.CheckMain(m)
 }

@@ -74,7 +74,9 @@ func TestMain(m *testing.M) {
 	// Refer to https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/
 	framework.NewSuite(m).
 		Label(label.CustomSetup).
-		RequireEnvironmentVersion("1.18").
+		RequireMinVersion(18).
+		// https://github.com/istio/istio/issues/22161. 1.22 drops support for legacy-unknown signer
+		RequireMaxVersion(21).
 		Setup(istio.Setup(&inst, setupConfig)).
 		Setup(func(ctx resource.Context) error {
 			return SetupApps(ctx, apps)

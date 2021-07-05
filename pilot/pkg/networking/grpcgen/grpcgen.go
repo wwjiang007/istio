@@ -24,7 +24,8 @@ import (
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
-	"github.com/golang/protobuf/ptypes/any"
+	envoyauth "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
@@ -49,27 +50,31 @@ import (
 // using the generic structures. "Classical" CDS/LDS/RDS/EDS use separate logic -
 // this is used for the API-based LDS and generic messages.
 
+// TransportSocket proto message has a `name` field which is expected to be set
+// to this value by the management server.
+const transportSocketName = "envoy.transport_sockets.tls"
+
 type GrpcConfigGenerator struct{}
 
 func (g *GrpcConfigGenerator) Generate(proxy *model.Proxy, push *model.PushContext,
-	w *model.WatchedResource, updates *model.PushRequest) (model.Resources, error) {
+	w *model.WatchedResource, updates *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
 	switch w.TypeUrl {
 	case v3.ListenerType:
-		return g.BuildListeners(proxy, push, w.ResourceNames), nil
+		return g.BuildListeners(proxy, push, w.ResourceNames), model.DefaultXdsLogDetails, nil
 	case v3.ClusterType:
-		return g.BuildClusters(proxy, push, w.ResourceNames), nil
+		return g.BuildClusters(proxy, push, w.ResourceNames), model.DefaultXdsLogDetails, nil
 	case v3.RouteType:
-		return g.BuildHTTPRoutes(proxy, push, w.ResourceNames), nil
+		return g.BuildHTTPRoutes(proxy, push, w.ResourceNames), model.DefaultXdsLogDetails, nil
 	}
 
-	return nil, nil
+	return nil, model.DefaultXdsLogDetails, nil
 }
 
 // handleLDSApiType handles a LDS request, returning listeners of ApiListener type.
 // The request may include a list of resource names, using the full_hostname[:port] format to select only
 // specific services.
-func (g *GrpcConfigGenerator) BuildListeners(node *model.Proxy, push *model.PushContext, names []string) []*any.Any {
-	resp := []*any.Any{}
+func (g *GrpcConfigGenerator) BuildListeners(node *model.Proxy, push *model.PushContext, names []string) model.Resources {
+	resp := model.Resources{}
 
 	filter := map[string]bool{}
 	for _, name := range names {
@@ -124,7 +129,10 @@ func (g *GrpcConfigGenerator) BuildListeners(node *model.Proxy, push *model.Push
 				ll.ApiListener = &listener.ApiListener{
 					ApiListener: hcmAny,
 				}
-				resp = append(resp, util.MessageToAny(ll))
+				resp = append(resp, &discovery.Resource{
+					Name:     hp,
+					Resource: util.MessageToAny(ll),
+				})
 			}
 		}
 	}
@@ -134,8 +142,8 @@ func (g *GrpcConfigGenerator) BuildListeners(node *model.Proxy, push *model.Push
 
 // Handle a gRPC CDS request, used with the 'ApiListener' style of requests.
 // The main difference is that the request includes Resources.
-func (g *GrpcConfigGenerator) BuildClusters(node *model.Proxy, push *model.PushContext, names []string) []*any.Any {
-	resp := []*any.Any{}
+func (g *GrpcConfigGenerator) BuildClusters(node *model.Proxy, push *model.PushContext, names []string) model.Resources {
+	resp := model.Resources{}
 	// gRPC doesn't currently support any of the APIs - returning just the expected EDS result.
 	// Since the code is relatively strict - we'll add info as needed.
 	for _, n := range names {
@@ -144,6 +152,40 @@ func (g *GrpcConfigGenerator) BuildClusters(node *model.Proxy, push *model.PushC
 			log.Warn("Failed to parse ", n, " ", err)
 			continue
 		}
+
+		porti, err := strconv.Atoi(portn)
+		if err != nil {
+			log.Warn("Failed to parse ", n, " ", err)
+			continue
+		}
+
+		// SANS associated with this host name.
+		// TODO: apply DestinationRules, etc
+		sans := push.ServiceAccounts[host.Name(hn)][porti]
+
+		// Assumes 'default' name, and credentials/tls/certprovider/pemfile
+
+		tlsC := &envoyauth.UpstreamTlsContext{
+			CommonTlsContext: &envoyauth.CommonTlsContext{
+				TlsCertificateCertificateProviderInstance: &envoyauth.CommonTlsContext_CertificateProviderInstance{
+					InstanceName:    "default",
+					CertificateName: "default",
+				},
+
+				ValidationContextType: &envoyauth.CommonTlsContext_CombinedValidationContext{
+					CombinedValidationContext: &envoyauth.CommonTlsContext_CombinedCertificateValidationContext{
+						ValidationContextCertificateProviderInstance: &envoyauth.CommonTlsContext_CertificateProviderInstance{
+							InstanceName:    "default",
+							CertificateName: "ROOTCA",
+						},
+						DefaultValidationContext: &envoyauth.CertificateValidationContext{
+							MatchSubjectAltNames: util.StringToExactMatch(sans),
+						},
+					},
+				},
+			},
+		}
+
 		rc := &cluster.Cluster{
 			Name:                 n,
 			ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
@@ -155,8 +197,16 @@ func (g *GrpcConfigGenerator) BuildClusters(node *model.Proxy, push *model.PushC
 					},
 				},
 			},
+			TransportSocket: &core.TransportSocket{
+				Name:       transportSocketName,
+				ConfigType: &core.TransportSocket_TypedConfig{TypedConfig: util.MessageToAny(tlsC)},
+			},
 		}
-		resp = append(resp, util.MessageToAny(rc))
+		// see grpc/xds/internal/client/xds.go securityConfigFromCluster
+		resp = append(resp, &discovery.Resource{
+			Name:     n,
+			Resource: util.MessageToAny(rc),
+		})
 	}
 	return resp
 }
@@ -164,8 +214,8 @@ func (g *GrpcConfigGenerator) BuildClusters(node *model.Proxy, push *model.PushC
 // handleSplitRDS supports per-VIP routes, as used by GRPC.
 // This mode is indicated by using names containing full host:port instead of just port.
 // Returns true of the request is of this type.
-func (g *GrpcConfigGenerator) BuildHTTPRoutes(node *model.Proxy, push *model.PushContext, routeNames []string) []*any.Any {
-	resp := []*any.Any{}
+func (g *GrpcConfigGenerator) BuildHTTPRoutes(node *model.Proxy, push *model.PushContext, routeNames []string) model.Resources {
+	resp := model.Resources{}
 
 	// Currently this mode is only used by GRPC, to extract Cluster for the default
 	// route.
@@ -212,7 +262,10 @@ func (g *GrpcConfigGenerator) BuildHTTPRoutes(node *model.Proxy, push *model.Pus
 						},
 					},
 				}
-				resp = append(resp, util.MessageToAny(rc))
+				resp = append(resp, &discovery.Resource{
+					Name:     n,
+					Resource: util.MessageToAny(rc),
+				})
 			}
 		}
 	}

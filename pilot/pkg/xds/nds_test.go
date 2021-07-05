@@ -79,7 +79,7 @@ func TestNDS(t *testing.T) {
 			})
 
 			ads := s.ConnectADS().WithType(v3.NameTableType)
-			res := ads.RequestResponseAck(&discovery.DiscoveryRequest{
+			res := ads.RequestResponseAck(t, &discovery.DiscoveryRequest{
 				Node: &corev3.Node{
 					Id:       ads.ID,
 					Metadata: tt.meta.ToStruct(),
@@ -87,6 +87,7 @@ func TestNDS(t *testing.T) {
 			})
 
 			var nt nds.NameTable
+			// nolint: staticcheck
 			err := ptypes.UnmarshalAny(res.Resources[0], &nt)
 			if err != nil {
 				t.Fatal("Failed to unmarshal name table", err)

@@ -22,11 +22,12 @@ import (
 	"istio.io/istio/pkg/test/framework/components/cluster/clusterboot"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/common"
+	"istio.io/istio/pkg/test/framework/config"
 	"istio.io/istio/pkg/test/framework/image"
 	"istio.io/istio/pkg/test/framework/resource"
 )
 
-var settings = &image.Settings{
+var imgSettings = &image.Settings{
 	Hub:             "testing.hub",
 	Tag:             "latest",
 	PullPolicy:      "Always",
@@ -35,10 +36,11 @@ var settings = &image.Settings{
 
 func TestDeploymentYAML(t *testing.T) {
 	testCase := []struct {
-		name         string
-		wantFilePath string
-		config       echo.Config
-		revVerMap    resource.RevVerMap
+		name          string
+		wantFilePath  string
+		config        echo.Config
+		revVerMap     resource.RevVerMap
+		compatibility bool
 	}{
 		{
 			name:         "basic",
@@ -153,13 +155,14 @@ func TestDeploymentYAML(t *testing.T) {
 				"rev-a": resource.IstioVersion("1.8.2"),
 				"rev-b": resource.IstioVersion("1.9.0"),
 			},
+			compatibility: true,
 		},
 	}
 	for _, tc := range testCase {
 		t.Run(tc.name, func(t *testing.T) {
 			clusters, err := clusterboot.NewFactory().With(cluster.Config{
 				Kind: cluster.Fake, Name: "cluster-0",
-				Meta: cluster.ConfigMeta{"majorVersion": 1, "minorVersion": 16},
+				Meta: config.Map{"majorVersion": 1, "minorVersion": 16},
 			}).Build()
 			if err != nil {
 				t.Fatal(err)
@@ -168,11 +171,18 @@ func TestDeploymentYAML(t *testing.T) {
 			if err := common.FillInDefaults(nil, &tc.config); err != nil {
 				t.Errorf("failed filling in defaults: %v", err)
 			}
+			if !config.Parsed() {
+				config.Parse()
+			}
+			settings := &resource.Settings{
+				Revisions:     tc.revVerMap,
+				Compatibility: tc.compatibility,
+			}
 			serviceYAML, err := GenerateService(tc.config)
 			if err != nil {
 				t.Errorf("failed to generate service %v", err)
 			}
-			deploymentYAML, err := generateDeploymentYAML(tc.config, settings, tc.revVerMap)
+			deploymentYAML, err := GenerateDeployment(tc.config, imgSettings, settings)
 			if err != nil {
 				t.Errorf("failed to generate deployment %v", err)
 			}

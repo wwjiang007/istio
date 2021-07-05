@@ -32,7 +32,7 @@ import (
 	v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/wasm/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	protobuf "github.com/gogo/protobuf/types"
-	"github.com/golang/protobuf/ptypes"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -157,6 +157,21 @@ var (
 	HTTPMx = buildHTTPMxFilter()
 )
 
+func BuildRouterFilter(ctx *RouterFilterContext) *hcm.HttpFilter {
+	if ctx == nil {
+		return Router
+	}
+
+	return &hcm.HttpFilter{
+		Name: wellknown.Router,
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: util.MessageToAny(&router.Router{
+				StartChildSpan: ctx.StartChildSpan,
+			}),
+		},
+	}
+}
+
 var (
 	// These ALPNs are injected in the client side by the ALPN filter.
 	// "istio" is added for each upstream protocol in order to make it
@@ -208,7 +223,7 @@ func buildHTTPMxFilter() *hcm.HttpFilter {
 		},
 	}
 
-	typed, err := ptypes.MarshalAny(httpMxConfigProto)
+	typed, err := anypb.New(httpMxConfigProto)
 	if err != nil {
 		return nil
 	}

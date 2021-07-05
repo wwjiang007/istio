@@ -26,11 +26,13 @@ import (
 
 	"istio.io/istio/pkg/test"
 	appEcho "istio.io/istio/pkg/test/echo/client"
+	"istio.io/istio/pkg/test/echo/common/scheme"
 	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/common"
 	"istio.io/istio/pkg/test/framework/resource"
 	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/istio/pkg/util/istiomultierror"
 )
 
 const (
@@ -204,23 +206,32 @@ func (c *instance) Restart() error {
 
 // aggregateResponses forwards an echo request from all workloads belonging to this echo instance and aggregates the results.
 func (c *instance) aggregateResponses(opts echo.CallOptions, retry bool, retryOptions ...retry.Option) (appEcho.ParsedResponses, error) {
+	// TODO put this somewhere else, or require users explicitly set the protocol
+	if c.Config().IsProxylessGRPC() && opts.Scheme == scheme.GRPC {
+		// for gRPC calls, use XDS resolver
+		opts.Scheme = scheme.XDS
+	}
+
 	resps := make([]*appEcho.ParsedResponse, 0)
 	workloads, err := c.Workloads()
 	if err != nil {
 		return nil, err
 	}
-	var aggErr error
+	aggErr := istiomultierror.New()
 	for _, w := range workloads {
-		out, err := common.ForwardEcho(c.cfg.Service, w.(*workload).Client, &opts, retry, retryOptions...)
+		clusterName := w.(*workload).cluster.Name()
+		serviceName := fmt.Sprintf("%s (cluster=%s)", c.cfg.Service, clusterName)
+
+		out, err := common.ForwardEcho(serviceName, w.(*workload).Client, &opts, retry, retryOptions...)
 		if err != nil {
-			aggErr = multierror.Append(err, aggErr)
+			aggErr = multierror.Append(aggErr, err)
 			continue
 		}
 		for _, r := range out {
 			resps = append(resps, r)
 		}
 	}
-	if aggErr != nil {
+	if aggErr.ErrorOrNil() != nil {
 		return nil, aggErr
 	}
 

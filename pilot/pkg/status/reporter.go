@@ -34,6 +34,11 @@ import (
 	"istio.io/pkg/ledger"
 )
 
+func GenStatusReporterMapKey(conID string, distributionType xds.EventType) string {
+	key := conID + "~" + distributionType
+	return key
+}
+
 func NewIstioContext(stop <-chan struct{}) context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -77,7 +82,7 @@ const (
 
 // Init starts all the read only features of the reporter, used for nonce generation
 // and responding to istioctl wait.
-func (r *Reporter) Init(ledger ledger.Ledger) {
+func (r *Reporter) Init(ledger ledger.Ledger, stop <-chan struct{}) {
 	r.ledger = ledger
 	if r.clock == nil {
 		r.clock = clock.RealClock{}
@@ -90,7 +95,7 @@ func (r *Reporter) Init(ledger ledger.Ledger) {
 	r.status = make(map[string]string)
 	r.reverseStatus = make(map[string]map[string]struct{})
 	r.inProgressResources = make(map[string]*inProgressEntry)
-	go r.readFromEventQueue()
+	go r.readFromEventQueue(stop)
 }
 
 // Starts the reporter, which watches dataplane ack's and resource changes so that it can update status leader
@@ -214,14 +219,14 @@ func (r *Reporter) removeCompletedResource(completedResources []Resource) {
 func (r *Reporter) AddInProgressResource(res config.Config) {
 	tryLedgerPut(r.ledger, res)
 	myRes := ResourceFromModelConfig(res)
-	if myRes == nil {
+	if myRes == (Resource{}) {
 		scope.Errorf("Unable to locate schema for %v, will not update status.", res)
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.inProgressResources[myRes.ToModelKey()] = &inProgressEntry{
-		Resource:            *myRes,
+		Resource:            myRes,
 		completedIterations: 0,
 	}
 }
@@ -276,7 +281,7 @@ type distributionEvent struct {
 }
 
 func (r *Reporter) QueryLastNonce(conID string, distributionType xds.EventType) (noncePrefix string) {
-	key := conID + distributionType
+	key := GenStatusReporterMapKey(conID, distributionType)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.status[key]
@@ -301,17 +306,22 @@ func (r *Reporter) RegisterEvent(conID string, distributionType xds.EventType, n
 	}
 }
 
-func (r *Reporter) readFromEventQueue() {
-	for ev := range r.distributionEventQueue {
-		// TODO might need to batch this to prevent lock contention
-		r.processEvent(ev.conID, ev.distributionType, ev.nonce)
+func (r *Reporter) readFromEventQueue(stop <-chan struct{}) {
+	for {
+		select {
+		case ev := <-r.distributionEventQueue:
+			// TODO might need to batch this to prevent lock contention
+			r.processEvent(ev.conID, ev.distributionType, ev.nonce)
+		case <-stop:
+			return
+		}
 	}
 }
 
 func (r *Reporter) processEvent(conID string, distributionType xds.EventType, nonce string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	key := conID + distributionType // TODO: delimit?
+	key := GenStatusReporterMapKey(conID, distributionType)
 	r.deleteKeyFromReverseMap(key)
 	var version string
 	if len(nonce) > 12 {
@@ -345,7 +355,7 @@ func (r *Reporter) RegisterDisconnect(conID string, types []xds.EventType) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, xdsType := range types {
-		key := conID + xdsType // TODO: delimit?
+		key := GenStatusReporterMapKey(conID, xdsType)
 		r.deleteKeyFromReverseMap(key)
 		delete(r.status, key)
 	}

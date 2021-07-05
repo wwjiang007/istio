@@ -18,7 +18,6 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
-	"github.com/golang/protobuf/ptypes"
 
 	"istio.io/istio/pilot/pkg/xds"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
@@ -31,7 +30,7 @@ func TestECDS(t *testing.T) {
 
 	ads := s.ConnectADS().WithType(v3.ExtensionConfigurationType)
 	wantExtensionConfigName := "extension-config"
-	res := ads.RequestResponseAck(&discovery.DiscoveryRequest{
+	res := ads.RequestResponseAck(t, &discovery.DiscoveryRequest{
 		Node: &corev3.Node{
 			Id: ads.ID,
 		},
@@ -39,7 +38,7 @@ func TestECDS(t *testing.T) {
 	})
 
 	var ec corev3.TypedExtensionConfig
-	err := ptypes.UnmarshalAny(res.Resources[0], &ec)
+	err := res.Resources[0].UnmarshalTo(&ec)
 	if err != nil {
 		t.Fatal("Failed to unmarshal extension config", err)
 		return

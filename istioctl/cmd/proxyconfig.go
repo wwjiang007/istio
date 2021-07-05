@@ -37,6 +37,7 @@ import (
 
 const (
 	jsonOutput    = "json"
+	yamlOutput    = "yaml"
 	summaryOutput = "short"
 )
 
@@ -156,7 +157,7 @@ func extractConfigDump(podName, podNamespace string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to create k8s client: %v", err)
 	}
 	path := "config_dump"
-	debug, err := kubeClient.EnvoyDo(context.TODO(), podName, podNamespace, "GET", path, nil)
+	debug, err := kubeClient.EnvoyDo(context.TODO(), podName, podNamespace, "GET", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute command on %s.%s sidecar: %v", podName, podNamespace, err)
 	}
@@ -214,7 +215,7 @@ func setupEnvoyLogConfig(param, podName, podNamespace string) (string, error) {
 	if param != "" {
 		path = path + "?" + param
 	}
-	result, err := kubeClient.EnvoyDo(context.TODO(), podName, podNamespace, "POST", path, nil)
+	result, err := kubeClient.EnvoyDo(context.TODO(), podName, podNamespace, "POST", path)
 	if err != nil {
 		return "", fmt.Errorf("failed to execute command on Envoy: %v", err)
 	}
@@ -247,7 +248,7 @@ func setupPodClustersWriter(podName, podNamespace string, out io.Writer) (*clust
 		return nil, fmt.Errorf("failed to create k8s client: %v", err)
 	}
 	path := "clusters?format=json"
-	debug, err := kubeClient.EnvoyDo(context.TODO(), podName, podNamespace, "GET", path, nil)
+	debug, err := kubeClient.EnvoyDo(context.TODO(), podName, podNamespace, "GET", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute command on Envoy: %v", err)
 	}
@@ -333,15 +334,16 @@ func clusterConfigCmd() *cobra.Command {
 			switch outputFormat {
 			case summaryOutput:
 				return configWriter.PrintClusterSummary(filter)
-			case jsonOutput:
-				return configWriter.PrintClusterDump(filter)
+			case jsonOutput, yamlOutput:
+				return configWriter.PrintClusterDump(filter, outputFormat)
 			default:
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
+		ValidArgsFunction: validPodsNameArgs,
 	}
 
-	clusterConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|short")
+	clusterConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
 	clusterConfigCmd.PersistentFlags().StringVar(&fqdn, "fqdn", "", "Filter clusters by substring of Service FQDN field")
 	clusterConfigCmd.PersistentFlags().StringVar(&direction, "direction", "", "Filter clusters by Direction field")
 	clusterConfigCmd.PersistentFlags().StringVar(&subset, "subset", "", "Filter clusters by substring of Subset field")
@@ -380,24 +382,31 @@ func allConfigCmd() *cobra.Command {
 		},
 		RunE: func(c *cobra.Command, args []string) error {
 			switch outputFormat {
-			case jsonOutput:
+			case jsonOutput, yamlOutput:
+				var dump []byte
+				var err error
 				if len(args) == 1 {
 					podName, podNamespace, err := getPodName(args[0])
 					if err != nil {
 						return err
 					}
-					dump, err := extractConfigDump(podName, podNamespace)
+					dump, err = extractConfigDump(podName, podNamespace)
 					if err != nil {
 						return err
 					}
-					fmt.Fprintln(c.OutOrStdout(), string(dump))
 				} else {
-					dump, err := readFile(configDumpFile)
+					dump, err = readFile(configDumpFile)
 					if err != nil {
 						return err
 					}
-					fmt.Fprintln(c.OutOrStdout(), string(dump))
 				}
+				if outputFormat == yamlOutput {
+					if dump, err = yaml.JSONToYAML(dump); err != nil {
+						return err
+					}
+				}
+				fmt.Fprintln(c.OutOrStdout(), string(dump))
+
 			case summaryOutput:
 				var configWriter *configdump.ConfigWriter
 				if len(args) == 1 {
@@ -439,11 +448,12 @@ func allConfigCmd() *cobra.Command {
 			}
 			return nil
 		},
+		ValidArgsFunction: validPodsNameArgs,
 	}
 
-	allConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|short")
+	allConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
 	allConfigCmd.PersistentFlags().StringVarP(&configDumpFile, "file", "f", "",
-		"Envoy config dump JSON file")
+		"Envoy config dump file")
 	allConfigCmd.PersistentFlags().BoolVar(&verboseProxyConfig, "verbose", true, "Output more information")
 
 	// cluster
@@ -516,15 +526,16 @@ func listenerConfigCmd() *cobra.Command {
 			switch outputFormat {
 			case summaryOutput:
 				return configWriter.PrintListenerSummary(filter)
-			case jsonOutput:
-				return configWriter.PrintListenerDump(filter)
+			case jsonOutput, yamlOutput:
+				return configWriter.PrintListenerDump(filter, outputFormat)
 			default:
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
+		ValidArgsFunction: validPodsNameArgs,
 	}
 
-	listenerConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|short")
+	listenerConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
 	listenerConfigCmd.PersistentFlags().StringVar(&address, "address", "", "Filter listeners by address field")
 	listenerConfigCmd.PersistentFlags().StringVar(&listenerType, "type", "", "Filter listeners by type field")
 	listenerConfigCmd.PersistentFlags().IntVar(&port, "port", 0, "Filter listeners by Port field")
@@ -651,6 +662,7 @@ func logCmd() *cobra.Command {
 			_, _ = fmt.Fprint(c.OutOrStdout(), resp)
 			return nil
 		},
+		ValidArgsFunction: validPodsNameArgs,
 	}
 
 	levelListString := fmt.Sprintf("[%s, %s, %s, %s, %s, %s, %s]",
@@ -722,15 +734,16 @@ func routeConfigCmd() *cobra.Command {
 			switch outputFormat {
 			case summaryOutput:
 				return configWriter.PrintRouteSummary(filter)
-			case jsonOutput:
-				return configWriter.PrintRouteDump(filter)
+			case jsonOutput, yamlOutput:
+				return configWriter.PrintRouteDump(filter, outputFormat)
 			default:
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
+		ValidArgsFunction: validPodsNameArgs,
 	}
 
-	routeConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|short")
+	routeConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
 	routeConfigCmd.PersistentFlags().StringVar(&routeName, "name", "", "Filter listeners by route name field")
 	routeConfigCmd.PersistentFlags().BoolVar(&verboseProxyConfig, "verbose", true, "Output more information")
 	routeConfigCmd.PersistentFlags().StringVarP(&configDumpFile, "file", "f", "",
@@ -797,15 +810,16 @@ func endpointConfigCmd() *cobra.Command {
 			switch outputFormat {
 			case summaryOutput:
 				return configWriter.PrintEndpointsSummary(filter)
-			case jsonOutput:
-				return configWriter.PrintEndpoints(filter)
+			case jsonOutput, yamlOutput:
+				return configWriter.PrintEndpoints(filter, outputFormat)
 			default:
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
+		ValidArgsFunction: validPodsNameArgs,
 	}
 
-	endpointConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|short")
+	endpointConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
 	endpointConfigCmd.PersistentFlags().StringVar(&address, "address", "", "Filter endpoints by address field")
 	endpointConfigCmd.PersistentFlags().IntVar(&port, "port", 0, "Filter endpoints by Port field")
 	endpointConfigCmd.PersistentFlags().StringVar(&clusterName, "cluster", "", "Filter endpoints by cluster name field")
@@ -819,6 +833,9 @@ func endpointConfigCmd() *cobra.Command {
 func bootstrapConfigCmd() *cobra.Command {
 	var podName, podNamespace string
 
+	// Shadow outputVariable since this command uses a different default value
+	var outputFormat string
+
 	bootstrapConfigCmd := &cobra.Command{
 		Use:   "bootstrap [<type>/]<name>[.<namespace>]",
 		Short: "Retrieves bootstrap configuration for the Envoy in the specified pod",
@@ -829,6 +846,9 @@ func bootstrapConfigCmd() *cobra.Command {
   # Retrieve full bootstrap without using Kubernetes API
   ssh <user@hostname> 'curl localhost:15000/config_dump' > envoy-config.json
   istioctl proxy-config bootstrap --file envoy-config.json
+
+  # Show a human-readable Istio and Envoy version summary
+  istioctl proxy-config bootstrap -o short
 `,
 		Aliases: []string{"b"},
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -852,10 +872,20 @@ func bootstrapConfigCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return configWriter.PrintBootstrapDump()
+
+			switch outputFormat {
+			case summaryOutput:
+				return configWriter.PrintVersionSummary()
+			case jsonOutput, yamlOutput:
+				return configWriter.PrintBootstrapDump(outputFormat)
+			default:
+				return fmt.Errorf("output format %q not supported", outputFormat)
+			}
 		},
+		ValidArgsFunction: validPodsNameArgs,
 	}
 
+	bootstrapConfigCmd.Flags().StringVarP(&outputFormat, "output", "o", jsonOutput, "Output format: one of json|yaml|short")
 	bootstrapConfigCmd.PersistentFlags().StringVarP(&configDumpFile, "file", "f", "",
 		"Envoy config dump JSON file")
 
@@ -900,15 +930,16 @@ func secretConfigCmd() *cobra.Command {
 			switch outputFormat {
 			case summaryOutput:
 				return configWriter.PrintSecretSummary()
-			case jsonOutput:
-				return configWriter.PrintSecretDump()
+			case jsonOutput, yamlOutput:
+				return configWriter.PrintSecretDump(outputFormat)
 			default:
 				return fmt.Errorf("output format %q not supported", outputFormat)
 			}
 		},
+		ValidArgsFunction: validPodsNameArgs,
 	}
 
-	secretConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|short")
+	secretConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
 	secretConfigCmd.PersistentFlags().StringVarP(&configDumpFile, "file", "f", "",
 		"Envoy config dump JSON file")
 	secretConfigCmd.Long += "\n\n" + ExperimentalMsg
@@ -925,7 +956,7 @@ func proxyConfig() *cobra.Command {
 		Aliases: []string{"pc"},
 	}
 
-	configCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|short")
+	configCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
 
 	configCmd.AddCommand(clusterConfigCmd())
 	configCmd.AddCommand(allConfigCmd())

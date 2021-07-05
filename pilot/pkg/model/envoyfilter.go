@@ -27,6 +27,8 @@ import (
 
 // EnvoyFilterWrapper is a wrapper for the EnvoyFilter api object with pre-processed data
 type EnvoyFilterWrapper struct {
+	Name             string
+	Namespace        string
 	workloadSelector labels.Instance
 	Patches          map[networking.EnvoyFilter_ApplyTo][]*EnvoyFilterConfigPatchWrapper
 }
@@ -44,6 +46,8 @@ type EnvoyFilterConfigPatchWrapper struct {
 	// regex match, but as an optimization we can reduce this to a prefix match for common cases.
 	// If this is set, ProxyVersionRegex is ignored.
 	ProxyPrefixMatch string
+	Name             string
+	Namespace        string
 }
 
 // wellKnownVersions defines a mapping of well known regex matches to prefix matches
@@ -66,7 +70,7 @@ var wellKnownVersions = map[string]string{
 func convertToEnvoyFilterWrapper(local *config.Config) *EnvoyFilterWrapper {
 	localEnvoyFilter := local.Spec.(*networking.EnvoyFilter)
 
-	out := &EnvoyFilterWrapper{}
+	out := &EnvoyFilterWrapper{Name: local.Name, Namespace: local.Namespace}
 	if localEnvoyFilter.WorkloadSelector != nil {
 		out.workloadSelector = localEnvoyFilter.WorkloadSelector.Labels
 	}
@@ -81,6 +85,8 @@ func convertToEnvoyFilterWrapper(local *config.Config) *EnvoyFilterWrapper {
 			continue
 		}
 		cpw := &EnvoyFilterConfigPatchWrapper{
+			Name:      local.Name,
+			Namespace: local.Namespace,
 			ApplyTo:   cp.ApplyTo,
 			Match:     cp.Match,
 			Operation: cp.Patch.Operation,
@@ -156,4 +162,18 @@ func proxyMatch(proxy *Proxy, cp *EnvoyFilterConfigPatchWrapper) bool {
 		}
 	}
 	return true
+}
+
+func (efw *EnvoyFilterWrapper) Key() string {
+	if efw == nil {
+		return ""
+	}
+	return efw.Namespace + "/" + efw.Name
+}
+
+func (cpw *EnvoyFilterConfigPatchWrapper) Key() string {
+	if cpw == nil {
+		return ""
+	}
+	return cpw.Namespace + "/" + cpw.Name
 }

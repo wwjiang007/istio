@@ -50,6 +50,7 @@ import (
 	memregistry "istio.io/istio/pilot/pkg/serviceregistry/memory"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pilot/test/xdstest"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/mesh"
@@ -238,7 +239,7 @@ func TestOutboundListenerConfig_WithSidecar(t *testing.T) {
 		CreationTime: tnow.Add(1 * time.Second),
 		Hostname:     host.Name("test4.com"),
 		Address:      wildcardIP,
-		ClusterVIPs:  make(map[string]string),
+		ClusterVIPs:  make(map[cluster.ID]string),
 		Ports: model.PortList{
 			&model.Port{
 				Name:     "udp",
@@ -256,7 +257,7 @@ func TestOutboundListenerConfig_WithSidecar(t *testing.T) {
 		CreationTime: tnow.Add(1 * time.Second),
 		Hostname:     host.Name("test5.com"),
 		Address:      "8.8.8.8",
-		ClusterVIPs:  make(map[string]string),
+		ClusterVIPs:  make(map[cluster.ID]string),
 		Ports: model.PortList{
 			&model.Port{
 				Name:     "MySQL",
@@ -274,7 +275,7 @@ func TestOutboundListenerConfig_WithSidecar(t *testing.T) {
 		CreationTime: tnow.Add(1 * time.Second),
 		Hostname:     host.Name("test6.com"),
 		Address:      "2.2.2.2",
-		ClusterVIPs:  make(map[string]string),
+		ClusterVIPs:  make(map[cluster.ID]string),
 		Ports: model.PortList{
 			&model.Port{
 				Name:     "unknown",
@@ -527,7 +528,7 @@ func TestOutboundListenerConfig_WithDisabledSniffing_WithSidecar(t *testing.T) {
 		CreationTime: tnow.Add(1 * time.Second),
 		Hostname:     host.Name("test4.com"),
 		Address:      wildcardIP,
-		ClusterVIPs:  make(map[string]string),
+		ClusterVIPs:  make(map[cluster.ID]string),
 		Ports: model.PortList{
 			&model.Port{
 				Name:     "default",
@@ -552,7 +553,7 @@ func TestOutboundTlsTrafficWithoutTimeout(t *testing.T) {
 			CreationTime: tnow,
 			Hostname:     host.Name("test.com"),
 			Address:      wildcardIP,
-			ClusterVIPs:  make(map[string]string),
+			ClusterVIPs:  make(map[cluster.ID]string),
 			Ports: model.PortList{
 				&model.Port{
 					Name:     "https",
@@ -569,7 +570,7 @@ func TestOutboundTlsTrafficWithoutTimeout(t *testing.T) {
 			CreationTime: tnow,
 			Hostname:     host.Name("test1.com"),
 			Address:      wildcardIP,
-			ClusterVIPs:  make(map[string]string),
+			ClusterVIPs:  make(map[cluster.ID]string),
 			Ports: model.PortList{
 				&model.Port{
 					Name:     "foo",
@@ -592,7 +593,7 @@ func TestOutboundTls(t *testing.T) {
 			CreationTime: tnow,
 			Hostname:     host.Name("test.com"),
 			Address:      wildcardIP,
-			ClusterVIPs:  make(map[string]string),
+			ClusterVIPs:  make(map[cluster.ID]string),
 			Ports: model.PortList{
 				&model.Port{
 					Name:     "https",
@@ -1098,6 +1099,10 @@ func verifyHTTPFilterChainMatch(t *testing.T, fc *listener.FilterChain, directio
 		t.Fatalf("failed to get HCM, config %v", hcm)
 	}
 
+	if hcm.DelayedCloseTimeout.AsDuration() != features.DelayedCloseTimeout.AsDuration() {
+		t.Fatalf("unexpected delayed close timeout expected :%v, got :%v", features.DelayedCloseTimeout, hcm.DelayedCloseTimeout)
+	}
+
 	hasAlpn := hasAlpnFilter(hcm.HttpFilters)
 
 	if direction == model.TrafficDirectionInbound && hasAlpn {
@@ -1525,10 +1530,10 @@ func TestOutboundListenerAccessLogs(t *testing.T) {
 	p := &fakePlugin{}
 	env := buildListenerEnv(nil)
 	env.Mesh().AccessLogFile = "foo"
-	listeners := buildAllListeners(p, env, nil)
+	listeners := buildAllListeners(p, env)
 	found := false
 	for _, l := range listeners {
-		if l.Name == VirtualOutboundListenerName {
+		if l.Name == model.VirtualOutboundListenerName {
 			fc := &tcp.TcpProxy{}
 			if err := getFilterConfig(l.FilterChains[1].Filters[0], fc); err != nil {
 				t.Fatalf("failed to get TCP Proxy config: %s", err)
@@ -1551,9 +1556,9 @@ func TestOutboundListenerAccessLogs(t *testing.T) {
 	accessLogBuilder.reset()
 
 	// Validate that access log filter uses the new format.
-	listeners = buildAllListeners(p, env, nil)
+	listeners = buildAllListeners(p, env)
 	for _, l := range listeners {
-		if l.Name == VirtualOutboundListenerName {
+		if l.Name == model.VirtualOutboundListenerName {
 			validateAccessLog(t, l, "format modified")
 		}
 	}
@@ -1564,7 +1569,7 @@ func TestListenerAccessLogs(t *testing.T) {
 	p := &fakePlugin{}
 	env := buildListenerEnv(nil)
 	env.Mesh().AccessLogFile = "foo"
-	listeners := buildAllListeners(p, env, nil)
+	listeners := buildAllListeners(p, env)
 	for _, l := range listeners {
 
 		if l.AccessLog == nil {
@@ -1581,7 +1586,7 @@ func TestListenerAccessLogs(t *testing.T) {
 	accessLogBuilder.reset()
 
 	// Validate that access log filter uses the new format.
-	listeners = buildAllListeners(p, env, nil)
+	listeners = buildAllListeners(p, env)
 	for _, l := range listeners {
 		if l.AccessLog[0].Filter == nil {
 			t.Fatal("expected filter config in listener access log configuration")
@@ -1666,7 +1671,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
-				CustomTags: defaultTags(),
+				CustomTags: customTracingTags(),
 			},
 		},
 		{
@@ -1714,7 +1719,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
-				CustomTags: defaultTags(),
+				CustomTags: customTracingTags(),
 			},
 		},
 		{
@@ -1738,7 +1743,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
-				CustomTags: defaultTags(),
+				CustomTags: customTracingTags(),
 			},
 		},
 		{
@@ -1762,7 +1767,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
-				CustomTags: defaultTags(),
+				CustomTags: customTracingTags(),
 			},
 		},
 		{
@@ -1786,7 +1791,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
-				CustomTags: defaultTags(),
+				CustomTags: customTracingTags(),
 			},
 		},
 		{
@@ -1811,7 +1816,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
-				CustomTags: defaultTags(),
+				CustomTags: customTracingTags(),
 			},
 		},
 		{
@@ -1836,7 +1841,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
-				CustomTags: defaultTags(),
+				CustomTags: customTracingTags(),
 			},
 		},
 		{
@@ -1908,7 +1913,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 							},
 						},
 					},
-				}, defaultTags()...),
+				}, customTracingTags()...),
 			},
 		},
 		{
@@ -2023,7 +2028,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 							},
 						},
 					},
-				}, defaultTags()...),
+				}, customTracingTags()...),
 			},
 		},
 	}
@@ -2032,9 +2037,9 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 
 	for _, tc := range customTagsTest {
 		featuresSet := false
-		capturedSamplingValue := pilotTraceSamplingEnv
+		capturedSamplingValue := features.TraceSampling
 		if tc.envPilotSampling != 0.0 {
-			pilotTraceSamplingEnv = tc.envPilotSampling
+			features.TraceSampling = tc.envPilotSampling
 			featuresSet = true
 		}
 
@@ -2063,9 +2068,45 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 		verifyHTTPConnectionManagerFilter(t, f, tc.out, tc.name)
 
 		if featuresSet {
-			pilotTraceSamplingEnv = capturedSamplingValue
+			features.TraceSampling = capturedSamplingValue
 		}
 	}
+}
+
+func customTracingTags() []*tracing.CustomTag {
+	return append(buildOptionalPolicyTags(),
+		&tracing.CustomTag{
+			Tag: "istio.canonical_revision",
+			Type: &tracing.CustomTag_Literal_{
+				Literal: &tracing.CustomTag_Literal{
+					Value: "latest",
+				},
+			},
+		},
+		&tracing.CustomTag{
+			Tag: "istio.canonical_service",
+			Type: &tracing.CustomTag_Literal_{
+				Literal: &tracing.CustomTag_Literal{
+					Value: "unknown",
+				},
+			},
+		},
+		&tracing.CustomTag{
+			Tag: "istio.mesh_id",
+			Type: &tracing.CustomTag_Literal_{
+				Literal: &tracing.CustomTag_Literal{
+					Value: "unknown",
+				},
+			},
+		},
+		&tracing.CustomTag{
+			Tag: "istio.namespace",
+			Type: &tracing.CustomTag_Literal_{
+				Literal: &tracing.CustomTag_Literal{
+					Value: "not-default",
+				},
+			},
+		})
 }
 
 func verifyHTTPConnectionManagerFilter(t *testing.T, f *listener.Filter, expected *hcm.HttpConnectionManager_Tracing, name string) {
@@ -2280,7 +2321,7 @@ func getOldestService(services ...*model.Service) *model.Service {
 	return oldestService
 }
 
-func buildAllListeners(p plugin.Plugin, env *model.Environment, proxyVersion *model.IstioVersion) []*listener.Listener {
+func buildAllListeners(p plugin.Plugin, env *model.Environment) []*listener.Listener {
 	configgen := NewConfigGenerator([]plugin.Plugin{p}, &model.DisabledCache{})
 
 	if err := env.PushContext.InitContext(env, nil, nil); err != nil {
@@ -2290,7 +2331,6 @@ func buildAllListeners(p plugin.Plugin, env *model.Environment, proxyVersion *mo
 	proxy := getProxy()
 	proxy.ServiceInstances = nil
 	proxy.SidecarScope = model.DefaultSidecarScopeForNamespace(env.PushContext, "not-default")
-	proxy.IstioVersion = proxyVersion
 	builder := NewListenerBuilder(proxy, env.PushContext)
 	return configgen.buildSidecarListeners(builder).getListeners()
 }
@@ -2298,6 +2338,7 @@ func buildAllListeners(p plugin.Plugin, env *model.Environment, proxyVersion *mo
 func getFilterConfig(filter *listener.Filter, out proto.Message) error {
 	switch c := filter.ConfigType.(type) {
 	case *listener.Filter_TypedConfig:
+		// nolint: staticcheck
 		if err := ptypes.UnmarshalAny(c.TypedConfig, out); err != nil {
 			return err
 		}
@@ -2437,7 +2478,7 @@ func buildService(hostname string, ip string, protocol protocol.Instance, creati
 		CreationTime: creationTime,
 		Hostname:     host.Name(hostname),
 		Address:      ip,
-		ClusterVIPs:  make(map[string]string),
+		ClusterVIPs:  make(map[cluster.ID]string),
 		Ports: model.PortList{
 			&model.Port{
 				Name:     "default",
@@ -2457,7 +2498,7 @@ func buildServiceWithPort(hostname string, port int, protocol protocol.Instance,
 		CreationTime: creationTime,
 		Hostname:     host.Name(hostname),
 		Address:      wildcardIP,
-		ClusterVIPs:  make(map[string]string),
+		ClusterVIPs:  make(map[cluster.ID]string),
 		Ports: model.PortList{
 			&model.Port{
 				Name:     "default",
@@ -2602,7 +2643,7 @@ func TestAppendListenerFallthroughRouteForCompleteListener(t *testing.T) {
 			filter := tests[idx].listener.DefaultFilterChain.Filters[0]
 			var tcpProxy tcp.TcpProxy
 			cfg := filter.GetTypedConfig()
-			_ = ptypes.UnmarshalAny(cfg, &tcpProxy)
+			_ = cfg.UnmarshalTo(&tcpProxy)
 			if tcpProxy.StatPrefix != tests[idx].hostname {
 				t.Errorf("Expected stat prefix %s but got %s\n", tests[idx].hostname, tcpProxy.StatPrefix)
 			}

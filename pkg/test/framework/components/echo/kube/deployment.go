@@ -28,11 +28,9 @@ import (
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/hashicorp/go-multierror"
-	"gopkg.in/yaml.v3"
 	kubeCore "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
@@ -89,20 +87,27 @@ spec:
 `
 
 	deploymentYAML = `
-{{- $revVerMap := .IstioVersions }}
+{{- $revVerMap := .Revisions }}
 {{- $subsets := .Subsets }}
 {{- $cluster := .Cluster }}
 {{- range $i, $subset := $subsets }}
 {{- range $revision, $version := $revVerMap }}
 apiVersion: apps/v1
+{{- if $.StatefulSet }}
+kind: StatefulSet
+{{- else }}
 kind: Deployment
+{{- end }}
 metadata:
-{{- if $.IsMultiVersion }}
+{{- if $.Compatibility }}
   name: {{ $.Service }}-{{ $subset.Version }}-{{ $revision }}
 {{- else }}
   name: {{ $.Service }}-{{ $subset.Version }}
 {{- end }}
 spec:
+  {{- if $.StatefulSet }}
+  serviceName: {{ $.Service }}
+  {{- end }}
   replicas: 1
   selector:
     matchLabels:
@@ -116,7 +121,8 @@ spec:
       labels:
         app: {{ $.Service }}
         version: {{ $subset.Version }}
-{{- if $.IsMultiVersion }}
+        test.istio.io/class: {{ $.Class }}
+{{- if $.Compatibility }}
         istio.io/rev: {{ $revision }}
 {{- end }}
 {{- if ne $.Locality "" }}
@@ -137,7 +143,10 @@ spec:
       - name: {{ $.ImagePullSecret }}
 {{- end }}
       containers:
-{{- if ne ($subset.Annotations.GetByName "sidecar.istio.io/inject") "false" }}
+{{- if and
+  (ne ($subset.Annotations.GetByName "sidecar.istio.io/inject") "false")
+  (ne ($subset.Annotations.GetByName "inject.istio.io/templates") "grpc")
+}}
       - name: istio-proxy
         image: auto
         securityContext: # to allow core dumps
@@ -145,7 +154,7 @@ spec:
 {{- end }}
 {{- if $.IncludeExtAuthz }}
       - name: ext-authz
-        image: docker.io/istio/ext-authz:0.6
+        image: gcr.io/istio-testing/ext-authz:0.7
         imagePullPolicy: {{ $.PullPolicy }}
         ports:
         - containerPort: 8000
@@ -245,14 +254,19 @@ spec:
         - mountPath: /etc/certs/custom
           name: custom-certs
       volumes:
+{{- if $.TLSSettings.ProxyProvision }}
+      - emptyDir:
+          medium: Memory
+{{- else }}
       - configMap:
           name: {{ $.Service }}-certs
+{{- end }}
         name: custom-certs
 {{- end }}
 ---
 {{- end }}
 {{- end }}
-{{- if .TLSSettings }}
+{{- if .TLSSettings}}{{if not .TLSSettings.ProxyProvision }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -265,7 +279,7 @@ data:
   key.pem: |
 {{.TLSSettings.Key | indent 4}}
 ---
-{{- end}}
+{{- end}}{{- end}}
 `
 
 	// vmDeploymentYaml aims to simulate a VM, but instead of managing the complex test setup of spinning up a VM,
@@ -346,8 +360,6 @@ spec:
           # read certs from correct directory
           sudo sh -c 'echo PROV_CERT=/var/run/secrets/istio >> /var/lib/istio/envoy/cluster.env'
           sudo sh -c 'echo OUTPUT_CERTS=/var/run/secrets/istio >> /var/lib/istio/envoy/cluster.env'
-          # Block standard inbound ports
-          sudo sh -c 'echo ISTIO_LOCAL_EXCLUDE_PORTS="15090,15021,15020" >> /var/lib/istio/envoy/cluster.env'
 
           # TODO: run with systemctl?
           export ISTIO_AGENT_FLAGS="--concurrency 2"
@@ -373,6 +385,20 @@ spec:
 {{- end }}
 {{- if $p.LocalhostIP }}
              --bind-localhost={{ $p.Port }} \
+{{- end }}
+{{- end }}
+{{- range $i, $p := $.WorkloadOnlyPorts }}
+{{- if eq .Protocol "TCP" }}
+             --tcp \
+{{- else }}
+             --port \
+{{- end }}
+             "{{ $p.Port }}" \
+{{- if $p.TLS }}
+             --tls={{ $p.Port }} \
+{{- end }}
+{{- if $p.ServerFirst }}
+             --server-first={{ $p.Port }} \
 {{- end }}
 {{- end }}
              --crt=/var/lib/istio/cert.crt \
@@ -459,11 +485,11 @@ func newDeployment(ctx resource.Context, cfg echo.Config) (*deployment, error) {
 		}
 	}
 
-	deploymentYAML, err := generateDeploymentYAML(cfg, nil, ctx.Settings().IstioVersions)
+	deploymentYAML, err := GenerateDeployment(cfg, nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed generating echo deployment YAML for %s/%s",
+		return nil, fmt.Errorf("failed generating echo deployment YAML for %s/%s: %v",
 			cfg.Namespace.Name(),
-			cfg.Service)
+			cfg.Service, err)
 	}
 
 	// Apply the deployment to the configured cluster.
@@ -556,8 +582,8 @@ spec:
 `, name, podIP, sa, network, service, version)
 }
 
-func generateDeploymentYAML(cfg echo.Config, settings *image.Settings, versions resource.RevVerMap) (string, error) {
-	params, err := templateParams(cfg, settings, versions)
+func GenerateDeployment(cfg echo.Config, imgSettings *image.Settings, settings *resource.Settings) (string, error) {
+	params, err := templateParams(cfg, imgSettings, settings)
 	if err != nil {
 		return "", err
 	}
@@ -571,7 +597,7 @@ func generateDeploymentYAML(cfg echo.Config, settings *image.Settings, versions 
 }
 
 func GenerateService(cfg echo.Config) (string, error) {
-	params, err := templateParams(cfg, nil, resource.RevVerMap{})
+	params, err := templateParams(cfg, nil, nil)
 	if err != nil {
 		return "", err
 	}
@@ -579,46 +605,54 @@ func GenerateService(cfg echo.Config) (string, error) {
 	return tmpl.Execute(serviceTemplate, params)
 }
 
-const DefaultVMImage = "app_sidecar_ubuntu_bionic"
+var VMImages = map[echo.VMDistro]string{
+	echo.UbuntuXenial: "app_sidecar_ubuntu_xenial",
+	echo.UbuntuFocal:  "app_sidecar_ubuntu_focal",
+	echo.UbuntuBionic: "app_sidecar_ubuntu_bionic",
+	echo.Debian9:      "app_sidecar_debian_9",
+	echo.Debian10:     "app_sidecar_debian_10",
+	echo.Centos7:      "app_sidecar_centos_7",
+	echo.Centos8:      "app_sidecar_centos_8",
+}
 
-func templateParams(cfg echo.Config, settings *image.Settings, versions resource.RevVerMap) (map[string]interface{}, error) {
+func templateParams(cfg echo.Config, imgSettings *image.Settings, settings *resource.Settings) (map[string]interface{}, error) {
 	if settings == nil {
 		var err error
-		settings, err = image.SettingsFromCommandLine()
+		settings, err = resource.SettingsFromCommandLine("template")
 		if err != nil {
 			return nil, err
 		}
 	}
-	supportStartupProbe := cfg.Cluster.MinKubeVersion(16, 0)
+	if imgSettings == nil {
+		var err error
+		imgSettings, err = image.SettingsFromCommandLine()
+		if err != nil {
+			return nil, err
+		}
+	}
+	supportStartupProbe := cfg.Cluster.MinKubeVersion(0)
 
-	// if image is not provided, default to app_sidecar
-	vmImage := DefaultVMImage
-	if cfg.VMImage != "" {
-		vmImage = cfg.VMImage
+	vmImage := VMImages[cfg.VMDistro]
+	if vmImage == "" {
+		vmImage = VMImages[echo.DefaultVMDistro]
+		log.Warnf("no image for distro %s, defaulting to %s", cfg.VMDistro, echo.DefaultVMDistro)
 	}
 	namespace := ""
 	if cfg.Namespace != nil {
 		namespace = cfg.Namespace.Name()
 	}
-	imagePullSecret := ""
-	if settings.ImagePullSecret != "" {
-		data, err := ioutil.ReadFile(settings.ImagePullSecret)
-		if err != nil {
-			return nil, err
-		}
-		secret := unstructured.Unstructured{Object: map[string]interface{}{}}
-		if err := yaml.Unmarshal(data, secret.Object); err != nil {
-			return nil, err
-		}
-		imagePullSecret = secret.GetName()
+	imagePullSecret, err := imgSettings.ImagePullSecretName()
+	if err != nil {
+		return nil, err
 	}
 	params := map[string]interface{}{
-		"Hub":                settings.Hub,
-		"Tag":                strings.TrimSuffix(settings.Tag, "-distroless"),
-		"PullPolicy":         settings.PullPolicy,
+		"Hub":                imgSettings.Hub,
+		"Tag":                strings.TrimSuffix(imgSettings.Tag, "-distroless"),
+		"PullPolicy":         imgSettings.PullPolicy,
 		"Service":            cfg.Service,
 		"Version":            cfg.Version,
 		"Headless":           cfg.Headless,
+		"StatefulSet":        cfg.StatefulSet,
 		"Locality":           cfg.Locality,
 		"ServiceAccount":     cfg.ServiceAccount,
 		"Ports":              cfg.Ports,
@@ -635,8 +669,9 @@ func templateParams(cfg echo.Config, settings *image.Settings, versions resource
 		},
 		"StartupProbe":    supportStartupProbe,
 		"IncludeExtAuthz": cfg.IncludeExtAuthz,
-		"IstioVersions":   versions.TemplateMap(),
-		"IsMultiVersion":  versions.IsMultiVersion(),
+		"Revisions":       settings.Revisions.TemplateMap(),
+		"Compatibility":   settings.Compatibility,
+		"Class":           getConfigClass(cfg),
 	}
 	return params, nil
 }
@@ -673,6 +708,7 @@ spec:
   metadata:
     labels:
       app: {{.name}}
+      test.istio.io/class: {{ .class }}
   template:
     serviceAccount: {{.serviceaccount}}
     network: "{{.network}}"
@@ -690,6 +726,7 @@ spec:
 		"namespace":      cfg.Namespace.Name(),
 		"serviceaccount": serviceAccount(cfg),
 		"network":        cfg.Cluster.NetworkName(),
+		"class":          getConfigClass(cfg),
 	})
 
 	// Push the WorkloadGroup for auto-registration
@@ -805,6 +842,25 @@ spec:
 	}
 
 	return nil
+}
+
+func getConfigClass(cfg echo.Config) string {
+	if cfg.IsProxylessGRPC() {
+		return "proxyless"
+	} else if cfg.IsVM() {
+		return "vm"
+	} else if cfg.IsTProxy() {
+		return "tproxy"
+	} else if cfg.IsNaked() {
+		return "naked"
+	} else if cfg.IsExternal() {
+		return "external"
+	} else if cfg.IsStatefulSet() {
+		return "statefulset"
+	} else if cfg.IsHeadless() {
+		return "headless"
+	}
+	return "standard"
 }
 
 func patchProxyConfigFile(file string, overrides string) error {

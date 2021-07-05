@@ -20,7 +20,6 @@ import (
 	"io/ioutil"
 	"os"
 
-	envoy_corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	xdsapi "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/spf13/cobra"
 
@@ -83,7 +82,7 @@ Retrieves last sent and last acknowledged xDS sync from Istiod to each Envoy in 
 					envoyDump, err = readConfigFile(configDumpFile)
 				} else {
 					path := "config_dump"
-					envoyDump, err = kubeClient.EnvoyDo(context.TODO(), podName, ns, "GET", path, nil)
+					envoyDump, err = kubeClient.EnvoyDo(context.TODO(), podName, ns, "GET", path)
 				}
 				if err != nil {
 					return err
@@ -194,19 +193,16 @@ Retrieves last sent and last acknowledged xDS sync from Istiod to each Envoy in 
 					return err
 				}
 				path := "config_dump"
-				envoyDump, err := kubeClient.EnvoyDo(context.TODO(), podName, ns, "GET", path, nil)
+				envoyDump, err := kubeClient.EnvoyDo(context.TODO(), podName, ns, "GET", path)
 				if err != nil {
 					return fmt.Errorf("could not contact sidecar: %w", err)
 				}
 
 				xdsRequest := xdsapi.DiscoveryRequest{
 					ResourceNames: []string{fmt.Sprintf("%s.%s", podName, ns)},
-					Node: &envoy_corev3.Node{
-						Id: "debug~0.0.0.0~istioctl~cluster.local",
-					},
-					TypeUrl: pilotxds.TypeDebugConfigDump,
+					TypeUrl:       pilotxds.TypeDebugConfigDump,
 				}
-				xdsResponses, err := multixds.FirstRequestAndProcessXds(&xdsRequest, &centralOpts, istioNamespace, "", "", kubeClient)
+				xdsResponses, err := multixds.FirstRequestAndProcessXds(&xdsRequest, centralOpts, istioNamespace, "", "", kubeClient)
 				if err != nil {
 					return err
 				}
@@ -218,12 +214,9 @@ Retrieves last sent and last acknowledged xDS sync from Istiod to each Envoy in 
 			}
 
 			xdsRequest := xdsapi.DiscoveryRequest{
-				Node: &envoy_corev3.Node{
-					Id: "debug~0.0.0.0~istioctl~cluster.local",
-				},
 				TypeUrl: pilotxds.TypeDebugSyncronization,
 			}
-			xdsResponses, err := multixds.AllRequestAndProcessXds(&xdsRequest, &centralOpts, istioNamespace, "", "", kubeClient)
+			xdsResponses, err := multixds.AllRequestAndProcessXds(&xdsRequest, centralOpts, istioNamespace, "", "", kubeClient)
 			if err != nil {
 				return err
 			}

@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -110,6 +111,9 @@ func InstallCmd(logOpts *log.Options) *cobra.Command {
 
   # To override a setting that includes dots, escape them with a backslash (\).  Your shell may require enclosing quotes.
   istioctl install --set "values.sidecarInjectorWebhook.injectedAnnotations.container\.apparmor\.security\.beta\.kubernetes\.io/istio-proxy=runtime/default"
+
+  # For setting boolean-string option, it should be enclosed quotes and escaped with a backslash (\).
+  istioctl install --set meshConfig.defaultConfig.proxyMetadata.PROXY_XDS_VIA_AGENT=\"false\"
 `,
 		Args: cobra.ExactArgs(0),
 		PreRunE: func(cmd *cobra.Command, args []string) error {
@@ -133,24 +137,24 @@ func runApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *installArgs, log
 	var opts clioptions.ControlPlaneOptions
 	kubeClient, err := kube.NewExtendedClient(kube.BuildClientCmd(iArgs.kubeConfigPath, iArgs.context), opts.Revision)
 	if err != nil {
-		return err
+		return fmt.Errorf("create Kubernetes client: %v", err)
 	}
 	restConfig, clientset, client, err := K8sConfig(iArgs.kubeConfigPath, iArgs.context)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetch Kubernetes config file: %v", err)
 	}
 	if err := k8sversion.IsK8VersionSupported(clientset, l); err != nil {
-		return err
+		return fmt.Errorf("check minimum supported Kubernetes version: %v", err)
 	}
 	tag, err := GetTagVersion(operatorVer.OperatorVersionString)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetch Istio version: %v", err)
 	}
 	setFlags := applyFlagAliases(iArgs.set, iArgs.manifestsPath, iArgs.revision)
 
 	_, iop, err := manifest.GenerateConfig(iArgs.inFilenames, setFlags, iArgs.force, restConfig, l)
 	if err != nil {
-		return err
+		return fmt.Errorf("generate config: %v", err)
 	}
 
 	profile, ns, enabledComponents, err := getProfileNSAndEnabledComponents(iop)
@@ -252,6 +256,7 @@ func savedIOPName(iop *v1alpha12.IstioOperator) string {
 // DetectIstioVersionDiff will show warning if istioctl version and control plane version are different
 // nolint: interfacer
 func DetectIstioVersionDiff(cmd *cobra.Command, tag string, ns string, kubeClient kube.ExtendedClient, setFlags []string) error {
+	warnMarker := color.New(color.FgYellow).Add(color.Italic).Sprint("WARNING:")
 	icps, err := kubeClient.GetIstioVersions(context.TODO(), ns)
 	if err != nil {
 		return err
@@ -284,16 +289,17 @@ func DetectIstioVersionDiff(cmd *cobra.Command, tag string, ns string, kubeClien
 			} else {
 				msg = "An older"
 			}
-			cmd.Printf("! Istio control planes installed: %s.\n"+
-				"! "+msg+" installed version of Istio has been detected. Running this command will overwrite it.\n", strings.Join(icpTags, ", "))
+			cmd.Printf("%s Istio control planes installed: %s.\n"+
+				"%s "+msg+" installed version of Istio has been detected. Running this command will overwrite it.\n", warnMarker, strings.Join(icpTags, ", "), warnMarker)
 		}
 		// when the revision is passed
 		if icpTag != "" && tag != icpTag && revision != "" {
-			if icpTag > tag {
-				cmd.Printf("! Istio is being upgraded from %s -> %s.\n"+
-					"! Before upgrading, you may wish to use 'istioctl analyze' to check for IST0002 and IST0135 deprecation warnings.\n", icpTag, tag)
+			if icpTag < tag {
+				cmd.Printf("%s Istio is being upgraded from %s -> %s.\n"+
+					"%s Before upgrading, you may wish to use 'istioctl analyze' to check for"+
+					"IST0002 and IST0135 deprecation warnings.\n", warnMarker, icpTag, tag, warnMarker)
 			} else {
-				cmd.Printf("! Istio is being downgraded from %s -> %s.", icpTag, tag)
+				cmd.Printf("%s Istio is being downgraded from %s -> %s.", warnMarker, icpTag, tag)
 			}
 		}
 	}
@@ -327,13 +333,13 @@ func getProfileNSAndEnabledComponents(iop *v1alpha12.IstioOperator) (string, str
 			}
 		}
 		for _, c := range iop.Spec.Components.IngressGateways {
-			if c.Enabled.Value {
+			if c.Enabled.GetValue() {
 				enabledComponents = append(enabledComponents, name.UserFacingComponentName(name.IngressComponentName))
 				break
 			}
 		}
 		for _, c := range iop.Spec.Components.EgressGateways {
-			if c.Enabled.Value {
+			if c.Enabled.GetValue() {
 				enabledComponents = append(enabledComponents, name.UserFacingComponentName(name.EgressComponentName))
 				break
 			}

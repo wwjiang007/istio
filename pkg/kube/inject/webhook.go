@@ -273,8 +273,8 @@ func toAdmissionResponse(err error) *kube.AdmissionResponse {
 
 type InjectionParameters struct {
 	pod                 *corev1.Pod
-	deployMeta          *metav1.ObjectMeta
-	typeMeta            *metav1.TypeMeta
+	deployMeta          metav1.ObjectMeta
+	typeMeta            metav1.TypeMeta
 	templates           Templates
 	defaultTemplate     []string
 	aliases             map[string][]string
@@ -296,7 +296,7 @@ func checkPreconditions(params InjectionParameters) {
 	}
 }
 
-func getInjectionStatus(podSpec corev1.PodSpec) string {
+func getInjectionStatus(podSpec corev1.PodSpec, revision string) string {
 	stat := &SidecarInjectionStatus{}
 	for _, c := range podSpec.InitContainers {
 		stat.InitContainers = append(stat.InitContainers, c.Name)
@@ -310,6 +310,12 @@ func getInjectionStatus(podSpec corev1.PodSpec) string {
 	for _, c := range podSpec.ImagePullSecrets {
 		stat.ImagePullSecrets = append(stat.ImagePullSecrets, c.Name)
 	}
+	// Rather than setting istio.io/rev label on injected pods include them here in status annotation.
+	// This keeps us from overwriting the istio.io/rev label when using revision tags (i.e. istio.io/rev=<tag>).
+	if revision == "" {
+		revision = "default"
+	}
+	stat.Revision = revision
 	statusAnnotationValue, err := json.Marshal(stat)
 	if err != nil {
 		return "{}"
@@ -545,7 +551,7 @@ func applyMetadata(pod *corev1.Pod, injectedPodData corev1.Pod, req InjectionPar
 		pod.Labels[label.TopologyNetwork.Name] = nw
 	}
 	// Add all additional injected annotations. These are overridden if needed
-	pod.Annotations[annotation.SidecarStatus.Name] = getInjectionStatus(injectedPodData.Spec)
+	pod.Annotations[annotation.SidecarStatus.Name] = getInjectionStatus(injectedPodData.Spec, req.revision)
 
 	// Deprecated; should be set directly in the template instead
 	for k, v := range req.injectedAnnotations {
@@ -722,7 +728,7 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 	log.Debugf("OldObject: %v", string(req.OldObject.Raw))
 
 	wh.mu.RLock()
-	if !injectRequired(ignoredNamespaces, wh.Config, &pod.Spec, pod.ObjectMeta) {
+	if !injectRequired(IgnoredNamespaces, wh.Config, &pod.Spec, pod.ObjectMeta) {
 		log.Infof("Skipping %s/%s due to policy check", pod.ObjectMeta.Namespace, podName)
 		totalSkippedInjections.Increment()
 		wh.mu.RUnlock()
@@ -833,14 +839,40 @@ func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 }
 
 // parseInjectEnvs parse new envs from inject url path
-// follow format: /inject/k1/v1/k2/v2, any kv order works
-// eg. "/inject/cluster/cluster1", "/inject/net/network1/cluster/cluster1"
+// follow format: /inject/k1/v1/k2/v2 when values do not contain slashes,
+// follow format: /inject/:ENV:net=network1:ENV:cluster=cluster1:ENV:rootpage=/foo/bar
+// when values contain slashes.
 func parseInjectEnvs(path string) map[string]string {
 	path = strings.TrimSuffix(path, "/")
-	res := strings.Split(path, "/")
+	res := func(path string) []string {
+		parts := strings.SplitN(path, "/", 3)
+		// The 3rd part has to start with separator :ENV:
+		// If not, this inject path is considered using slash as separator
+		// If length is less than 3, then the path is simply "/inject",
+		// process just like before :ENV: separator is introduced.
+		var newRes []string
+		if len(parts) == 3 {
+			if strings.HasPrefix(parts[2], ":ENV:") {
+				pairs := strings.Split(parts[2], ":ENV:")
+				for i := 1; i < len(pairs); i++ { // skip the first part, it is a nil
+					pair := strings.SplitN(pairs[i], "=", 2)
+					// The first part is the variable name which can not be empty
+					// the second part is the variable value which can be empty but has to exist
+					// for example, aaa=bbb, aaa= are valid, but =aaa or = are not valid, the
+					// invalid ones will be ignored.
+					if len(pair[0]) > 0 && len(pair) == 2 {
+						newRes = append(newRes, pair...)
+					}
+				}
+				return newRes
+			}
+			return strings.Split(parts[2], "/")
+		}
+		return newRes
+	}(path)
 	newEnvs := make(map[string]string)
 
-	for i := 2; i < len(res); i += 2 { // skip '/inject'
+	for i := 0; i < len(res); i += 2 {
 		k := res[i]
 		if i == len(res)-1 { // ignore the last key without value
 			log.Warnf("Odd number of inject env entries, ignore the last key %s\n", k)

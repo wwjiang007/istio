@@ -21,7 +21,6 @@ import (
 	"strings"
 	"testing"
 
-	"istio.io/api/label"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
@@ -40,30 +39,41 @@ func TestRevisionTags(t *testing.T) {
 				name     string
 				tag      string
 				revision string
+				nsLabel  string
 				error    string
 			}{
 				{
-					"prod-tag-pointed-to-stable",
+					"prod tag pointed to stable",
 					"prod",
 					"stable",
+					"istio.io/rev=prod",
 					"",
 				},
 				{
-					"prod-tag-pointed-to-canary",
+					"prod tag pointed to canary",
 					"prod",
 					"canary",
+					"istio.io/rev=prod",
 					"",
 				},
 				{
-					"tag-pointed-to-non-existent-revision",
+					"tag pointed to non existent revision",
 					"prod",
 					"fake-revision",
+					"istio.io/rev=prod",
 					"cannot modify tag",
+				},
+				{
+					"default tag-injects for istio injection enabled",
+					"default",
+					"stable",
+					"istio-injection=enabled",
+					"",
 				},
 			}
 
 			istioCtl := istioctl.NewOrFail(t, t, istioctl.Config{Cluster: t.Clusters().Default()})
-			baseArgs := []string{"experimental", "tag"}
+			baseArgs := []string{"experimental", "revision", "tag"}
 			for _, tc := range tcs {
 				t.NewSubTest(tc.name).Run(func(t framework.TestContext) {
 					tagSetArgs := append(baseArgs, "set", tc.tag, "--revision", tc.revision, "--skip-confirmation")
@@ -86,30 +96,45 @@ func TestRevisionTags(t *testing.T) {
 						return
 					}
 
-					// build namespace labeled with tag and create echo in that namespace
+					// Expect the specified revision to inject for the namespace with the
+					// given injection label
 					revTagNs := namespace.NewOrFail(t, t, namespace.Config{
-						Prefix:   "rev-tag",
-						Inject:   true,
-						Revision: tc.tag,
+						Prefix: "revision-tag",
 					})
+					nsLabelParts := strings.Split(tc.nsLabel, "=")
+					if len(nsLabelParts) != 2 {
+						t.Fatalf("invalid namespace label %s", tc.nsLabel)
+					}
+					if err := revTagNs.SetLabel(nsLabelParts[0], nsLabelParts[1]); err != nil {
+						t.Fatalf("couldn't set label %q on namespace %s: %w",
+							tc.nsLabel, revTagNs.Name(), err)
+					}
+
 					echoboot.NewBuilder(t).WithConfig(echo.Config{
-						Service:   "rev-tag",
+						Service:   "revision-tag",
 						Namespace: revTagNs,
 					}).BuildOrFail(t)
 
 					fetch := kubetest.NewSinglePodFetch(t.Clusters().Default(),
 						revTagNs.Name(),
-						fmt.Sprintf("app=%s", "rev-tag"))
+						fmt.Sprintf("app=%s", "revision-tag"))
 					pods, err := fetch()
 					if err != nil {
 						t.Fatalf("error fetching pods: %v", err)
 					}
 
-					injectedRevision := pods[0].GetLabels()[label.IoIstioRev.Name]
-					if injectedRevision != tc.revision {
-						t.Fatalf("expected revision tag %q, got %q", tc.revision, injectedRevision)
-					}
+					verifyRevision(t, istioCtl, pods[0].Name, revTagNs.Name(), tc.revision)
 				})
 			}
 		})
+}
+
+func verifyRevision(t framework.TestContext, i istioctl.Instance, podName, podNamespace, revision string) {
+	t.Helper()
+	pcArgs := []string{"pc", "bootstrap", podName, "-n", podNamespace}
+	bootstrapConfig, _ := i.InvokeOrFail(t, pcArgs)
+	expected := fmt.Sprintf("\"discoveryAddress\": \"istiod-%s.istio-system.svc:15012\"", revision)
+	if !strings.Contains(bootstrapConfig, expected) {
+		t.Errorf("expected revision %q in bootstrap config, did not find", revision)
+	}
 }

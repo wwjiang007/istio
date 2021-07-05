@@ -23,7 +23,7 @@ import (
 	redis "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/redis_proxy/v3"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
-	"github.com/golang/protobuf/ptypes"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
@@ -39,7 +39,7 @@ import (
 var redisOpTimeout = 5 * time.Second
 
 // buildInboundNetworkFilters generates a TCP proxy network filter on the inbound path
-func buildInboundNetworkFilters(push *model.PushContext, instance *model.ServiceInstance, node *model.Proxy, clusterName string) []*listener.Filter {
+func buildInboundNetworkFilters(push *model.PushContext, instance *model.ServiceInstance, clusterName string) []*listener.Filter {
 	statPrefix := clusterName
 	// If stat name is configured, build the stat prefix from configured pattern.
 	if len(push.Mesh.InboundClusterStatName) != 0 {
@@ -49,14 +49,14 @@ func buildInboundNetworkFilters(push *model.PushContext, instance *model.Service
 		StatPrefix:       statPrefix,
 		ClusterSpecifier: &tcp.TcpProxy_Cluster{Cluster: clusterName},
 	}
-	tcpFilter := setAccessLogAndBuildTCPFilter(push, tcpProxy, node)
+	tcpFilter := setAccessLogAndBuildTCPFilter(push, tcpProxy)
 	return buildNetworkFiltersStack(instance.ServicePort, tcpFilter, statPrefix, clusterName)
 }
 
 // setAccessLogAndBuildTCPFilter sets the AccessLog configuration in the given
 // TcpProxy instance and builds a TCP filter out of it.
-func setAccessLogAndBuildTCPFilter(push *model.PushContext, config *tcp.TcpProxy, node *model.Proxy) *listener.Filter {
-	accessLogBuilder.setTCPAccessLog(push.Mesh, config, node)
+func setAccessLogAndBuildTCPFilter(push *model.PushContext, config *tcp.TcpProxy) *listener.Filter {
+	accessLogBuilder.setTCPAccessLog(push.Mesh, config)
 
 	tcpFilter := &listener.Filter{
 		Name:       wellknown.TCPProxy,
@@ -77,10 +77,10 @@ func buildOutboundNetworkFiltersWithSingleDestination(push *model.PushContext, n
 
 	idleTimeout, err := time.ParseDuration(node.Metadata.IdleTimeout)
 	if err == nil {
-		tcpProxy.IdleTimeout = ptypes.DurationProto(idleTimeout)
+		tcpProxy.IdleTimeout = durationpb.New(idleTimeout)
 	}
 
-	tcpFilter := setAccessLogAndBuildTCPFilter(push, tcpProxy, node)
+	tcpFilter := setAccessLogAndBuildTCPFilter(push, tcpProxy)
 	return buildNetworkFiltersStack(port, tcpFilter, statPrefix, clusterName)
 }
 
@@ -101,7 +101,7 @@ func buildOutboundNetworkFiltersWithWeightedClusters(node *model.Proxy, routes [
 
 	idleTimeout, err := time.ParseDuration(node.Metadata.IdleTimeout)
 	if err == nil {
-		proxyConfig.IdleTimeout = ptypes.DurationProto(idleTimeout)
+		proxyConfig.IdleTimeout = durationpb.New(idleTimeout)
 	}
 
 	for _, route := range routes {
@@ -117,7 +117,7 @@ func buildOutboundNetworkFiltersWithWeightedClusters(node *model.Proxy, routes [
 
 	// TODO: Need to handle multiple cluster names for Redis
 	clusterName := clusterSpecifier.WeightedClusters.Clusters[0].Name
-	tcpFilter := setAccessLogAndBuildTCPFilter(push, proxyConfig, node)
+	tcpFilter := setAccessLogAndBuildTCPFilter(push, proxyConfig)
 	return buildNetworkFiltersStack(port, tcpFilter, statPrefix, clusterName)
 }
 
@@ -127,7 +127,11 @@ func buildNetworkFiltersStack(port *model.Port, tcpFilter *listener.Filter, stat
 	filterstack := make([]*listener.Filter, 0)
 	switch port.Protocol {
 	case protocol.Mongo:
-		filterstack = append(filterstack, buildMongoFilter(statPrefix), tcpFilter)
+		if features.EnableMongoFilter {
+			filterstack = append(filterstack, buildMongoFilter(statPrefix), tcpFilter)
+		} else {
+			filterstack = append(filterstack, tcpFilter)
+		}
 	case protocol.Redis:
 		if features.EnableRedisFilter {
 			// redis filter has route config, it is a terminating filter, no need append tcp filter.
@@ -208,7 +212,7 @@ func buildRedisFilter(statPrefix, clusterName string) *listener.Filter {
 		LatencyInMicros: true,       // redis latency stats are captured in micro seconds which is typically the case.
 		StatPrefix:      statPrefix, // redis stats are prefixed with redis.<statPrefix> by Envoy
 		Settings: &redis.RedisProxy_ConnPoolSettings{
-			OpTimeout: ptypes.DurationProto(redisOpTimeout), // TODO: Make this user configurable
+			OpTimeout: durationpb.New(redisOpTimeout), // TODO: Make this user configurable
 		},
 		PrefixRoutes: &redis.RedisProxy_PrefixRoutes{
 			CatchAllRoute: &redis.RedisProxy_PrefixRoutes_Route{

@@ -28,10 +28,10 @@ import (
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/any"
 	"k8s.io/client-go/kubernetes/fake"
 
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/config/kube/crd"
 	"istio.io/istio/pilot/pkg/model"
@@ -40,6 +40,7 @@ import (
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/spiffe"
@@ -101,6 +102,11 @@ var testCases = []ConfigInput{
 		Name:     "peerauthentication",
 		Services: 100,
 	},
+	{
+		Name:      "knative-gateway",
+		Services:  100,
+		ProxyType: model.Router,
+	},
 }
 
 func disableLogging() {
@@ -139,7 +145,7 @@ func BenchmarkRouteGeneration(b *testing.B) {
 			b.ResetTimer()
 			var c model.Resources
 			for n := 0; n < b.N; n++ {
-				c, _ = s.Discovery.Generators[v3.RouteType].Generate(proxy, s.PushContext(), &model.WatchedResource{ResourceNames: routeNames}, nil)
+				c, _, _ = s.Discovery.Generators[v3.RouteType].Generate(proxy, s.PushContext(), &model.WatchedResource{ResourceNames: routeNames}, nil)
 				if len(c) == 0 {
 					b.Fatal("Got no routes!")
 				}
@@ -153,13 +159,13 @@ func BenchmarkRouteGeneration(b *testing.B) {
 // update our benchmark doesn't become useless.
 func TestValidateTelemetry(t *testing.T) {
 	s, proxy := setupAndInitializeTest(t, ConfigInput{Name: "telemetry", Services: 1})
-	c, _ := s.Discovery.Generators[v3.ClusterType].Generate(proxy, s.PushContext(), nil, nil)
+	c, _, _ := s.Discovery.Generators[v3.ClusterType].Generate(proxy, s.PushContext(), nil, nil)
 	if len(c) == 0 {
 		t.Fatal("Got no clusters!")
 	}
 	for _, r := range c {
 		cls := &cluster.Cluster{}
-		if err := ptypes.UnmarshalAny(r, cls); err != nil {
+		if err := r.GetResource().UnmarshalTo(cls); err != nil {
 			t.Fatal(err)
 		}
 		for _, ff := range cls.Filters {
@@ -179,7 +185,7 @@ func BenchmarkClusterGeneration(b *testing.B) {
 			b.ResetTimer()
 			var c model.Resources
 			for n := 0; n < b.N; n++ {
-				c, _ = s.Discovery.Generators[v3.ClusterType].Generate(proxy, s.PushContext(), nil, nil)
+				c, _, _ = s.Discovery.Generators[v3.ClusterType].Generate(proxy, s.PushContext(), nil, nil)
 				if len(c) == 0 {
 					b.Fatal("Got no clusters!")
 				}
@@ -197,7 +203,7 @@ func BenchmarkListenerGeneration(b *testing.B) {
 			b.ResetTimer()
 			var c model.Resources
 			for n := 0; n < b.N; n++ {
-				c, _ = s.Discovery.Generators[v3.ListenerType].Generate(proxy, s.PushContext(), nil, nil)
+				c, _, _ = s.Discovery.Generators[v3.ListenerType].Generate(proxy, s.PushContext(), nil, nil)
 				if len(c) == 0 {
 					b.Fatal("Got no listeners!")
 				}
@@ -215,7 +221,7 @@ func BenchmarkNameTableGeneration(b *testing.B) {
 			b.ResetTimer()
 			var c model.Resources
 			for n := 0; n < b.N; n++ {
-				c, _ = s.Discovery.Generators[v3.NameTableType].Generate(proxy, s.PushContext(), nil, nil)
+				c, _, _ = s.Discovery.Generators[v3.NameTableType].Generate(proxy, s.PushContext(), nil, nil)
 				if len(c) == 0 && tt.ProxyType != model.Router {
 					b.Fatal("Got no name tables!")
 				}
@@ -258,7 +264,7 @@ func BenchmarkSecretGeneration(b *testing.B) {
 			b.ResetTimer()
 			var c model.Resources
 			for n := 0; n < b.N; n++ {
-				c, _ = gen.Generate(proxy, s.PushContext(), res, &model.PushRequest{Full: true})
+				c, _, _ = gen.Generate(proxy, s.PushContext(), res, &model.PushRequest{Full: true})
 				if len(c) == 0 {
 					b.Fatal("Got no secrets!")
 				}
@@ -268,10 +274,25 @@ func BenchmarkSecretGeneration(b *testing.B) {
 	}
 }
 
+func createGateways(n int) map[string]*meshconfig.Network {
+	out := make(map[string]*meshconfig.Network, n)
+	for i := 0; i < n; i++ {
+		out[fmt.Sprintf("network-%d", i)] = &meshconfig.Network{
+			Gateways: []*meshconfig.Network_IstioNetworkGateway{{
+				Gw:   &meshconfig.Network_IstioNetworkGateway_Address{Address: fmt.Sprintf("35.0.0.%d", i)},
+				Port: 15443,
+			}},
+		}
+	}
+	return out
+}
+
 // BenchmarkEDS measures performance of EDS config generation
 // TODO Add more variables, such as different services
 func BenchmarkEndpointGeneration(b *testing.B) {
 	disableLogging()
+
+	const numNetworks = 4
 	tests := []struct {
 		endpoints int
 		services  int
@@ -286,7 +307,10 @@ func BenchmarkEndpointGeneration(b *testing.B) {
 	for _, tt := range tests {
 		b.Run(fmt.Sprintf("%d/%d", tt.endpoints, tt.services), func(b *testing.B) {
 			s := NewFakeDiscoveryServer(b, FakeOptions{
-				Configs: createEndpoints(tt.endpoints, tt.services),
+				Configs: createEndpoints(tt.endpoints, tt.services, numNetworks),
+				NetworksWatcher: mesh.NewFixedNetworksWatcher(&meshconfig.MeshNetworks{
+					Networks: createGateways(numNetworks),
+				}),
 			})
 			proxy := &model.Proxy{
 				Type:            model.SidecarProxy,
@@ -306,7 +330,7 @@ func BenchmarkEndpointGeneration(b *testing.B) {
 				}
 				response = endpointDiscoveryResponse(loadAssignments, version, push.LedgerVersion)
 			}
-			logDebug(b, response.GetResources())
+			logDebug(b, model.AnyToUnnamedResources(response.GetResources()))
 		})
 	}
 }
@@ -328,7 +352,7 @@ func setupTest(t testing.TB, config ConfigInput) (*FakeDiscoveryServer, *model.P
 			Labels: map[string]string{
 				"istio.io/benchmark": "true",
 			},
-			IstioVersion: "1.10.0",
+			IstioVersion: "1.11.0",
 		},
 		ConfigNamespace: "default",
 	}
@@ -424,19 +448,22 @@ func logDebug(b *testing.B, m model.Resources) {
 	}
 	bytes := 0
 	for _, r := range m {
-		bytes += len(r.Value)
+		bytes += len(r.GetResource().Value)
 	}
 	b.ReportMetric(float64(bytes)/1000, "kb/msg")
 	b.ReportMetric(float64(len(m)), "resources/msg")
 	b.StartTimer()
 }
 
-func createEndpoints(numEndpoints int, numServices int) []config.Config {
+func createEndpoints(numEndpoints, numServices, numNetworks int) []config.Config {
 	result := make([]config.Config, 0, numServices)
 	for s := 0; s < numServices; s++ {
 		endpoints := make([]*networking.WorkloadEntry, 0, numEndpoints)
 		for e := 0; e < numEndpoints; e++ {
-			endpoints = append(endpoints, &networking.WorkloadEntry{Address: fmt.Sprintf("111.%d.%d.%d", e/(256*256), (e/256)%256, e%256)})
+			endpoints = append(endpoints, &networking.WorkloadEntry{
+				Address: fmt.Sprintf("111.%d.%d.%d", e/(256*256), (e/256)%256, e%256),
+				Network: fmt.Sprintf("network-%d", e%numNetworks),
+			})
 		}
 		result = append(result, config.Config{
 			Meta: config.Meta{

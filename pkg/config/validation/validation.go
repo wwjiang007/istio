@@ -15,6 +15,7 @@
 package validation
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -25,16 +26,18 @@ import (
 	"strings"
 	"time"
 
-	udpaa "github.com/cncf/udpa/go/udpa/annotations"
+	udpaa "github.com/cncf/xds/go/udpa/annotations"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/any"
 	"github.com/hashicorp/go-multierror"
+	"github.com/lestrrat-go/jwx/jwt"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 
+	"istio.io/api/annotation"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	security_beta "istio.io/api/security/v1beta1"
@@ -64,6 +67,9 @@ const (
 	// UnixAddressPrefix is the prefix used to indicate an address is for a Unix Domain socket. It is used in
 	// ServiceEntry.Endpoint.Address message.
 	UnixAddressPrefix = "unix://"
+
+	matchExact  = "exact:"
+	matchPrefix = "prefix:"
 )
 
 var (
@@ -122,6 +128,26 @@ type Validation struct {
 	Warning Warning
 }
 
+type AnalysisAwareError struct {
+	Type       string
+	Msg        string
+	Parameters []interface{}
+}
+
+// OverlappingMatchValidationForHTTPRoute holds necessary information from virtualservice
+// to do such overlapping match validation
+type OverlappingMatchValidationForHTTPRoute struct {
+	RouteStr         string
+	MatchStr         string
+	Prefix           string
+	MatchPort        uint32
+	MatchMethod      string
+	MatchAuthority   string
+	MatchHeaders     map[string]string
+	MatchQueryParams map[string]string
+	MatchNonHeaders  map[string]string
+}
+
 var _ error = Validation{}
 
 // WrapError turns an error into a Validation
@@ -159,8 +185,41 @@ func GetValidateFunc(name string) ValidateFunc {
 }
 
 func registerValidateFunc(name string, f ValidateFunc) ValidateFunc {
-	validateFuncs[name] = f
-	return f
+	// Wrap the original validate function with an extra validate function for the annotation "istio.io/dry-run".
+	validate := validateAnnotationDryRun(f)
+	validateFuncs[name] = validate
+	return validate
+}
+
+func validateAnnotationDryRun(f ValidateFunc) ValidateFunc {
+	return func(config config.Config) (Warning, error) {
+		_, isAuthz := config.Spec.(*security_beta.AuthorizationPolicy)
+		// Only the AuthorizationPolicy supports the annotation "istio.io/dry-run".
+		if err := checkDryRunAnnotation(config, isAuthz); err != nil {
+			return nil, err
+		}
+		return f(config)
+	}
+}
+
+func checkDryRunAnnotation(cfg config.Config, allowed bool) error {
+	if val, found := cfg.Annotations[annotation.IoIstioDryRun.Name]; found {
+		if !allowed {
+			return fmt.Errorf("%s/%s has unsupported annotation %s, please remove the annotation", cfg.Namespace, cfg.Name, annotation.IoIstioDryRun.Name)
+		}
+		if spec, ok := cfg.Spec.(*security_beta.AuthorizationPolicy); ok {
+			switch spec.Action {
+			case security_beta.AuthorizationPolicy_ALLOW, security_beta.AuthorizationPolicy_DENY:
+				if _, err := strconv.ParseBool(val); err != nil {
+					return fmt.Errorf("%s/%s has annotation %s with invalid value (%s): %v", cfg.Namespace, cfg.Name, annotation.IoIstioDryRun.Name, val, err)
+				}
+			default:
+				return fmt.Errorf("the annotation %s currently only supports action ALLOW/DENY, found action %v in %s/%s",
+					annotation.IoIstioDryRun.Name, spec.Action, cfg.Namespace, cfg.Name)
+			}
+		}
+	}
+	return nil
 }
 
 // ValidatePort checks that the network port is in range
@@ -245,6 +304,45 @@ func ValidateTrustDomain(domain string) error {
 func ValidateHTTPHeaderName(name string) error {
 	if name == "" {
 		return fmt.Errorf("header name cannot be empty")
+	}
+	return nil
+}
+
+// ValidateHTTPHeaderWithAuthorityOperationName validates a header name when used to add/set in request.
+func ValidateHTTPHeaderWithAuthorityOperationName(name string) error {
+	if name == "" {
+		return fmt.Errorf("header name cannot be empty")
+	}
+	// Authority header is validated later
+	if isInternalHeader(name) && !isAuthorityHeader(name) {
+		return fmt.Errorf(`invalid header %q: header cannot have ":" prefix`, name)
+	}
+	return nil
+}
+
+// ValidateHTTPHeaderWithHostOperationName validates a header name when used to destination specific add/set in request.
+// TODO(https://github.com/envoyproxy/envoy/issues/16775) merge with ValidateHTTPHeaderWithAuthorityOperationName
+func ValidateHTTPHeaderWithHostOperationName(name string) error {
+	if name == "" {
+		return fmt.Errorf("header name cannot be empty")
+	}
+	// Authority header is validated later
+	if isInternalHeader(name) && !strings.EqualFold(name, "host") {
+		return fmt.Errorf(`invalid header %q: header cannot have ":" prefix`, name)
+	}
+	return nil
+}
+
+// ValidateHTTPHeaderOperationName validates a header name when used to remove from request or modify response.
+func ValidateHTTPHeaderOperationName(name string) error {
+	if name == "" {
+		return fmt.Errorf("header name cannot be empty")
+	}
+	if strings.EqualFold(name, "host") {
+		return fmt.Errorf(`invalid header %q: cannot set Host header`, name)
+	}
+	if isInternalHeader(name) {
+		return fmt.Errorf(`invalid header %q: header cannot have ":" prefix`, name)
 	}
 	return nil
 }
@@ -657,6 +755,11 @@ var ValidateEnvoyFilter = registerValidateFunc("ValidateEnvoyFilter",
 					listenerMatch := cp.Match.GetListener()
 					if listenerMatch.FilterChain != nil {
 						if listenerMatch.FilterChain.Filter != nil {
+							if cp.ApplyTo == networking.EnvoyFilter_LISTENER || cp.ApplyTo == networking.EnvoyFilter_FILTER_CHAIN {
+								// This would be an error but is a warning for backwards compatibility
+								errs = appendValidation(errs, WrapWarning(
+									fmt.Errorf("Envoy filter: filter match has no effect when used with %v", cp.ApplyTo))) // nolint: golint,stylecheck
+							}
 							// filter names are required if network filter matches are being made
 							if listenerMatch.FilterChain.Filter.Name == "" {
 								errs = appendValidation(errs, fmt.Errorf("Envoy filter: filter match has no name to match on")) // nolint: golint,stylecheck
@@ -880,10 +983,10 @@ var ValidateSidecar = registerValidateFunc("ValidateSidecar",
 					// format should be 127.0.0.1:port or :port
 					parts := strings.Split(i.DefaultEndpoint, ":")
 					if len(parts) < 2 {
-						errs = appendErrors(errs, fmt.Errorf("sidecar: defaultEndpoint must be of form 127.0.0.1:<port> or 0.0.0.0:<port>"))
+						errs = appendErrors(errs, fmt.Errorf("sidecar: defaultEndpoint must be of form 127.0.0.1:<port>, 0.0.0.0:<port>, unix://filepath, or unset"))
 					} else {
 						if len(parts[0]) > 0 && parts[0] != "127.0.0.1" && parts[0] != "0.0.0.0" {
-							errs = appendErrors(errs, fmt.Errorf("sidecar: defaultEndpoint must be of form 127.0.0.1:<port> or 0.0.0.0:<port>"))
+							errs = appendErrors(errs, fmt.Errorf("sidecar: defaultEndpoint must be of form 127.0.0.1:<port>, 0.0.0.0:<port>, unix://filepath, or unset"))
 						}
 
 						port, err := strconv.Atoi(parts[1])
@@ -1054,6 +1157,10 @@ func validateOutlierDetection(outlier *networking.OutlierDetection) (errs Valida
 		warn := "outlier detection consecutive errors is deprecated, use consecutiveGatewayErrors or consecutive5xxErrors instead"
 		scope.Warnf(warn)
 		errs = appendValidation(errs, WrapWarning(errors.New(warn)))
+	}
+	if !outlier.SplitExternalLocalOriginErrors && outlier.ConsecutiveLocalOriginFailures.GetValue() > 0 {
+		err := "outlier detection consecutive local origin failures is specified, but split external local origin errors is set to false"
+		errs = appendValidation(errs, errors.New(err))
 	}
 	if outlier.Interval != nil {
 		errs = appendValidation(errs, ValidateDurationGogo(outlier.Interval))
@@ -1712,6 +1819,13 @@ func validateJwtRule(rule *security_beta.JWTRule) (errs error) {
 		}
 	}
 
+	if rule.Jwks != "" {
+		_, err := jwt.Parse([]byte(rule.Jwks))
+		if err != nil {
+			errs = multierror.Append(errs, errors.New("jwks parse error"))
+		}
+	}
+
 	for _, location := range rule.FromHeaders {
 		if location == nil {
 			errs = multierror.Append(errs, errors.New("location header name must be non-null"))
@@ -1853,8 +1967,370 @@ var ValidateVirtualService = registerValidateFunc("ValidateVirtualService",
 		}
 
 		errs = appendValidation(errs, validateExportTo(cfg.Namespace, virtualService.ExportTo, false))
+
+		warnUnused := func(ruleno, reason string) {
+			errs = appendValidation(errs, WrapWarning(&AnalysisAwareError{
+				Type:       "VirtualServiceUnreachableRule",
+				Msg:        fmt.Sprintf("virtualService rule %v not used (%s)", ruleno, reason),
+				Parameters: []interface{}{ruleno, reason},
+			}))
+		}
+		warnIneffective := func(ruleno, matchno, dupno string) {
+			errs = appendValidation(errs, WrapWarning(&AnalysisAwareError{
+				Type:       "VirtualServiceIneffectiveMatch",
+				Msg:        fmt.Sprintf("virtualService rule %v match %v is not used (duplicate/overlapping match in rule %v)", ruleno, matchno, dupno),
+				Parameters: []interface{}{ruleno, matchno, dupno},
+			}))
+		}
+
+		analyzeUnreachableHTTPRules(virtualService.Http, warnUnused, warnIneffective)
+		analyzeUnreachableTCPRules(virtualService.Tcp, warnUnused, warnIneffective)
+		analyzeUnreachableTLSRules(virtualService.Tls, warnUnused, warnIneffective)
+
 		return errs.Unwrap()
 	})
+
+func assignExactOrPrefix(exact, prefix string) string {
+	if exact != "" {
+		return matchExact + exact
+	}
+	if prefix != "" {
+		return matchPrefix + prefix
+	}
+	return ""
+}
+
+// genMatchHTTPRoutes build the match rules into struct OverlappingMatchValidationForHTTPRoute
+// based on particular HTTPMatchRequest, according to comments on https://github.com/istio/istio/pull/32701
+// only support Match's port, method, authority, headers, query params and nonheaders for now.
+func genMatchHTTPRoutes(route *networking.HTTPRoute, match *networking.HTTPMatchRequest,
+	rulen, matchn int) (matchHTTPRoutes *OverlappingMatchValidationForHTTPRoute) {
+	// skip current match if no match field for current route
+	if match == nil {
+		return nil
+	}
+	// skip current match if no URI field
+	if match.Uri == nil {
+		return nil
+	}
+	// store all httproute with prefix match uri
+	tmpPrefix := match.Uri.GetPrefix()
+	if tmpPrefix != "" {
+		// set Method
+		methodExact := match.Method.GetExact()
+		methodPrefix := match.Method.GetPrefix()
+		methodMatch := assignExactOrPrefix(methodExact, methodPrefix)
+		// if no method information, it should be GET by default
+		if methodMatch == "" {
+			methodMatch = matchExact + "GET"
+		}
+
+		// set Authority
+		authorityExact := match.Authority.GetExact()
+		authorityPrefix := match.Authority.GetPrefix()
+		authorityMatch := assignExactOrPrefix(authorityExact, authorityPrefix)
+
+		// set Headers
+		headerMap := make(map[string]string)
+		for hkey, hvalue := range match.Headers {
+			hvalueExact := hvalue.GetExact()
+			hvaluePrefix := hvalue.GetPrefix()
+			hvalueMatch := assignExactOrPrefix(hvalueExact, hvaluePrefix)
+			headerMap[hkey] = hvalueMatch
+		}
+
+		// set QueryParams
+		QPMap := make(map[string]string)
+		for qpkey, qpvalue := range match.QueryParams {
+			qpvalueExact := qpvalue.GetExact()
+			qpvaluePrefix := qpvalue.GetPrefix()
+			qpvalueMatch := assignExactOrPrefix(qpvalueExact, qpvaluePrefix)
+			QPMap[qpkey] = qpvalueMatch
+		}
+
+		// set WithoutHeaders
+		noHeaderMap := make(map[string]string)
+		for nhkey, nhvalue := range match.WithoutHeaders {
+			nhvalueExact := nhvalue.GetExact()
+			nhvaluePrefix := nhvalue.GetPrefix()
+			nhvalueMatch := assignExactOrPrefix(nhvalueExact, nhvaluePrefix)
+			noHeaderMap[nhkey] = nhvalueMatch
+		}
+
+		matchHTTPRoutes = &OverlappingMatchValidationForHTTPRoute{
+			routeName(route, rulen),
+			requestName(match, matchn),
+			tmpPrefix,
+			match.Port,
+			methodMatch,
+			authorityMatch,
+			headerMap,
+			QPMap,
+			noHeaderMap,
+		}
+		return
+	}
+	return nil
+}
+
+// coveredValidation validate the overlapping match between two instance of OverlappingMatchValidationForHTTPRoute
+func coveredValidation(vA, vB *OverlappingMatchValidationForHTTPRoute) bool {
+	// check the URI overlapping match, such as vB.Prefix is '/debugs' and vA.Prefix is '/debug'
+	if strings.HasPrefix(vB.Prefix, vA.Prefix) {
+		// check the port field
+		if vB.MatchPort != vA.MatchPort {
+			return false
+		}
+
+		// check the match method
+		if vA.MatchMethod != vB.MatchMethod {
+			if !strings.HasPrefix(vA.MatchMethod, vB.MatchMethod) {
+				return false
+			}
+		}
+
+		// check the match authority
+		if vA.MatchAuthority != vB.MatchAuthority {
+			if !strings.HasPrefix(vA.MatchAuthority, vB.MatchAuthority) {
+				return false
+			}
+		}
+
+		// check the match Headers
+		vAHeaderLen := len(vA.MatchHeaders)
+		vBHeaderLen := len(vB.MatchHeaders)
+		if vAHeaderLen != vBHeaderLen {
+			return false
+		}
+		for hdKey, hdValue := range vA.MatchHeaders {
+			vBhdValue, ok := vB.MatchHeaders[hdKey]
+			if !ok {
+				return false
+			} else if hdValue != vBhdValue {
+				if !strings.HasPrefix(hdValue, vBhdValue) {
+					return false
+				}
+			}
+		}
+
+		// check the match QueryParams
+		vAQPLen := len(vA.MatchQueryParams)
+		vBQPLen := len(vB.MatchQueryParams)
+		if vAQPLen != vBQPLen {
+			return false
+		}
+		for qpKey, qpValue := range vA.MatchQueryParams {
+			vBqpValue, ok := vB.MatchQueryParams[qpKey]
+			if !ok {
+				return false
+			} else if qpValue != vBqpValue {
+				if !strings.HasPrefix(qpValue, vBqpValue) {
+					return false
+				}
+			}
+		}
+
+		// check the match NonHeaders
+		vANonHDLen := len(vA.MatchNonHeaders)
+		vBNonHDLen := len(vB.MatchNonHeaders)
+		if vANonHDLen != vBNonHDLen {
+			return false
+		}
+		for nhKey, nhValue := range vA.MatchNonHeaders {
+			vBnhValue, ok := vB.MatchNonHeaders[nhKey]
+			if !ok {
+				return false
+			} else if nhValue != vBnhValue {
+				if !strings.HasPrefix(nhValue, vBnhValue) {
+					return false
+				}
+			}
+		}
+	} else {
+		// no URI overlapping match
+		return false
+	}
+	return true
+}
+
+func analyzeUnreachableHTTPRules(routes []*networking.HTTPRoute,
+	reportUnreachable func(ruleno, reason string), reportIneffective func(ruleno, matchno, dupno string)) {
+	matchesEncountered := make(map[string]int)
+	emptyMatchEncountered := -1
+	var matchHTTPRoutes []*OverlappingMatchValidationForHTTPRoute
+	for rulen, route := range routes {
+		if route == nil {
+			continue
+		}
+		if len(route.Match) == 0 {
+			if emptyMatchEncountered >= 0 {
+				reportUnreachable(routeName(route, rulen), "only the last rule can have no matches")
+			}
+			emptyMatchEncountered = rulen
+			continue
+		}
+
+		duplicateMatches := 0
+		for matchn, match := range route.Match {
+			dupn, ok := matchesEncountered[asJSON(match)]
+			if ok {
+				reportIneffective(routeName(route, rulen), requestName(match, matchn), routeName(routes[dupn], dupn))
+				duplicateMatches++
+				// no need to handle for totally duplicated match rules
+				continue
+			} else {
+				matchesEncountered[asJSON(match)] = rulen
+			}
+			// build the match rules into struct OverlappingMatchValidationForHTTPRoute based on current match
+			matchHTTPRoute := genMatchHTTPRoutes(route, match, rulen, matchn)
+			if matchHTTPRoute != nil {
+				matchHTTPRoutes = append(matchHTTPRoutes, matchHTTPRoute)
+			}
+		}
+		if duplicateMatches == len(route.Match) {
+			reportUnreachable(routeName(route, rulen), "all matches used by prior rules")
+		}
+	}
+
+	// at least 2 prefix matched routes for overlapping match validation
+	if len(matchHTTPRoutes) > 1 {
+		// check the overlapping match from the first prefix information
+		for routeIndex, routePrefix := range matchHTTPRoutes {
+			for rIndex := routeIndex + 1; rIndex < len(matchHTTPRoutes); rIndex++ {
+				// exclude the duplicate-match cases which have been validated above
+				if strings.Compare(matchHTTPRoutes[rIndex].Prefix, routePrefix.Prefix) == 0 {
+					continue
+				}
+				// Valid from A to B for matchHTTPRoutes
+				isAtoBCover := coveredValidation(routePrefix, matchHTTPRoutes[rIndex])
+				if isAtoBCover {
+					prefixMatchA := matchHTTPRoutes[rIndex].MatchStr + " of prefix " + matchHTTPRoutes[rIndex].Prefix
+					prefixMatchB := routePrefix.MatchStr + " of prefix " + routePrefix.Prefix + " on " + routePrefix.RouteStr
+					reportIneffective(matchHTTPRoutes[rIndex].RouteStr, prefixMatchA, prefixMatchB)
+				}
+
+				// Valid from B to A for matchHTTPRoutes
+				isBtoACover := coveredValidation(matchHTTPRoutes[rIndex], routePrefix)
+				if isBtoACover {
+					prefixMatchA := routePrefix.MatchStr + " of prefix " + routePrefix.Prefix
+					prefixMatchB := matchHTTPRoutes[rIndex].MatchStr + " of prefix " + matchHTTPRoutes[rIndex].Prefix + " on " + matchHTTPRoutes[rIndex].RouteStr
+					reportIneffective(routePrefix.RouteStr, prefixMatchA, prefixMatchB)
+				}
+			}
+		}
+	}
+}
+
+// NOTE: This method identical to analyzeUnreachableHTTPRules.
+func analyzeUnreachableTCPRules(routes []*networking.TCPRoute,
+	reportUnreachable func(ruleno, reason string), reportIneffective func(ruleno, matchno, dupno string)) {
+	matchesEncountered := make(map[string]int)
+	emptyMatchEncountered := -1
+	for rulen, route := range routes {
+		if route == nil {
+			continue
+		}
+		if len(route.Match) == 0 {
+			if emptyMatchEncountered >= 0 {
+				reportUnreachable(routeName(route, rulen), "only the last rule can have no matches")
+			}
+			emptyMatchEncountered = rulen
+			continue
+		}
+
+		duplicateMatches := 0
+		for matchn, match := range route.Match {
+			dupn, ok := matchesEncountered[asJSON(match)]
+			if ok {
+				reportIneffective(routeName(route, rulen), requestName(match, matchn), routeName(routes[dupn], dupn))
+				duplicateMatches++
+			} else {
+				matchesEncountered[asJSON(match)] = rulen
+			}
+		}
+		if duplicateMatches == len(route.Match) {
+			reportUnreachable(routeName(route, rulen), "all matches used by prior rules")
+		}
+	}
+}
+
+// NOTE: This method identical to analyzeUnreachableHTTPRules.
+func analyzeUnreachableTLSRules(routes []*networking.TLSRoute,
+	reportUnreachable func(ruleno, reason string), reportIneffective func(ruleno, matchno, dupno string)) {
+	matchesEncountered := make(map[string]int)
+	emptyMatchEncountered := -1
+	for rulen, route := range routes {
+		if route == nil {
+			continue
+		}
+		if len(route.Match) == 0 {
+			if emptyMatchEncountered >= 0 {
+				reportUnreachable(routeName(route, rulen), "only the last rule can have no matches")
+			}
+			emptyMatchEncountered = rulen
+			continue
+		}
+
+		duplicateMatches := 0
+		for matchn, match := range route.Match {
+			dupn, ok := matchesEncountered[asJSON(match)]
+			if ok {
+				reportIneffective(routeName(route, rulen), requestName(match, matchn), routeName(routes[dupn], dupn))
+				duplicateMatches++
+			} else {
+				matchesEncountered[asJSON(match)] = rulen
+			}
+		}
+		if duplicateMatches == len(route.Match) {
+			reportUnreachable(routeName(route, rulen), "all matches used by prior rules")
+		}
+	}
+}
+
+// asJSON() creates a JSON serialization of a match, to use for match comparison.  We don't use the JSON itself.
+func asJSON(data interface{}) string {
+	// Remove the name, so we can create a serialization that only includes traffic routing config
+	switch mr := data.(type) {
+	case *networking.HTTPMatchRequest:
+		if mr != nil && mr.Name != "" {
+			unnamed := *mr
+			unnamed.Name = ""
+			data = &unnamed
+		}
+	}
+
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err.Error()
+	}
+	return string(b)
+}
+
+func routeName(route interface{}, routen int) string {
+	switch r := route.(type) {
+	case *networking.HTTPRoute:
+		if r.Name != "" {
+			return fmt.Sprintf("%q", r.Name)
+		}
+
+		// TCP and TLS routes have no names
+	}
+
+	return fmt.Sprintf("#%d", routen)
+}
+
+func requestName(match interface{}, matchn int) string {
+	switch mr := match.(type) {
+	case *networking.HTTPMatchRequest:
+		if mr.Name != "" {
+			return fmt.Sprintf("%q", mr.Name)
+		}
+
+		// TCP and TLS matches have no names
+	}
+
+	return fmt.Sprintf("#%d", matchn)
+}
 
 func validateTLSRoute(tls *networking.TLSRoute, context *networking.VirtualService) error {
 	var errs error
@@ -2007,26 +2483,26 @@ func validateHTTPRouteDestinations(weights []*networking.HTTPRouteDestination) (
 
 		// header manipulations
 		for name, val := range weight.Headers.GetRequest().GetAdd() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderWithHostOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for name, val := range weight.Headers.GetRequest().GetSet() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderWithHostOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for _, name := range weight.Headers.GetRequest().GetRemove() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 		}
 		for name, val := range weight.Headers.GetResponse().GetAdd() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for name, val := range weight.Headers.GetResponse().GetSet() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for _, name := range weight.Headers.GetResponse().GetRemove() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 		}
 
 		errs = appendErrors(errs, validateDestination(weight.Destination))
@@ -2269,7 +2745,7 @@ func validateHTTPRewrite(rewrite *networking.HTTPRewrite) error {
 
 // ValidateWorkloadEntry validates a workload entry.
 var ValidateWorkloadEntry = registerValidateFunc("ValidateWorkloadEntry",
-	func(cfg config.Config) (warnings Warning, errs error) {
+	func(cfg config.Config) (Warning, error) {
 		we, ok := cfg.Spec.(*networking.WorkloadEntry)
 		if !ok {
 			return nil, fmt.Errorf("cannot cast to workload entry")
@@ -2277,13 +2753,40 @@ var ValidateWorkloadEntry = registerValidateFunc("ValidateWorkloadEntry",
 		return validateWorkloadEntry(we)
 	})
 
-func validateWorkloadEntry(we *networking.WorkloadEntry) (warnings Warning, errs error) {
+func validateWorkloadEntry(we *networking.WorkloadEntry) (Warning, error) {
+	errs := Validation{}
 	if we.Address == "" {
 		return nil, fmt.Errorf("address must be set")
 	}
-	// TODO: add better validation. The tricky thing is that we don't know if its meant to be
-	// DNS or STATIC type without association with a ServiceEntry
-	return nil, nil
+	// Since we don't know if its meant to be DNS or STATIC type without association with a ServiceEntry,
+	// check based on content and try validations.
+	addr := we.Address
+	// First check if it is a Unix endpoint - this will be specified for STATIC.
+	if strings.HasPrefix(we.Address, UnixAddressPrefix) {
+		errs = appendValidation(errs, ValidateUnixAddress(strings.TrimPrefix(addr, UnixAddressPrefix)))
+		if len(we.Ports) != 0 {
+			errs = appendValidation(errs, fmt.Errorf("unix endpoint %s must not include ports", we.Address))
+		}
+	} else {
+		// This could be IP (in STATIC resolution) or DNS host name (for DNS).
+		ipAddr := net.ParseIP(we.Address)
+		if ipAddr == nil {
+			if err := ValidateFQDN(we.Address); err != nil { // Otherwise could be an FQDN
+				errs = appendValidation(errs,
+					fmt.Errorf("endpoint address %q is not a valid FQDN or an IP address", we.Address))
+			}
+		}
+	}
+
+	errs = appendValidation(errs,
+		labels.Instance(we.Labels).Validate())
+	for name, port := range we.Ports {
+		// TODO: Validate port is part of Service Port - which is tricky to validate with out service entry.
+		errs = appendValidation(errs,
+			ValidatePortName(name),
+			ValidatePort(int(port)))
+	}
+	return errs.Unwrap()
 }
 
 // ValidateWorkloadGroup validates a workload group.
@@ -2754,4 +3257,8 @@ func validateNetwork(network *meshconfig.Network) (errs error) {
 		}
 	}
 	return
+}
+
+func (aae *AnalysisAwareError) Error() string {
+	return aae.Msg
 }

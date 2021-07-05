@@ -2575,6 +2575,86 @@ func TestValidateVirtualService(t *testing.T) {
 				}},
 			}},
 		}, valid: true, warning: true},
+		{name: "set authority", in: &networking.VirtualService{
+			Hosts: []string{"foo.bar"},
+			Http: []*networking.HTTPRoute{{
+				Headers: &networking.Headers{
+					Request: &networking.Headers_HeaderOperations{Set: map[string]string{":authority": "foo"}},
+				},
+				Route: []*networking.HTTPRouteDestination{{
+					Destination: &networking.Destination{Host: "foo.baz"},
+				}},
+			}},
+		}, valid: true, warning: false},
+		{name: "set authority in destination", in: &networking.VirtualService{
+			Hosts: []string{"foo.bar"},
+			Http: []*networking.HTTPRoute{{
+				Route: []*networking.HTTPRouteDestination{{
+					Destination: &networking.Destination{Host: "foo.baz"},
+					Headers: &networking.Headers{
+						Request: &networking.Headers_HeaderOperations{Set: map[string]string{":authority": "foo"}},
+					},
+				}},
+			}},
+		}, valid: false, warning: false},
+		{name: "set authority in rewrite and header", in: &networking.VirtualService{
+			Hosts: []string{"foo.bar"},
+			Http: []*networking.HTTPRoute{{
+				Headers: &networking.Headers{
+					Request: &networking.Headers_HeaderOperations{Set: map[string]string{":authority": "foo"}},
+				},
+				Rewrite: &networking.HTTPRewrite{Authority: "bar"},
+				Route: []*networking.HTTPRouteDestination{{
+					Destination: &networking.Destination{Host: "foo.baz"},
+				}},
+			}},
+		}, valid: false, warning: false},
+		{name: "non-method-get", in: &networking.VirtualService{
+			Hosts: []string{"foo.bar"},
+			Http: []*networking.HTTPRoute{{
+				Route: []*networking.HTTPRouteDestination{{
+					Destination: &networking.Destination{Host: "foo.baz"},
+				}},
+				Match: []*networking.HTTPMatchRequest{
+					{
+						Uri: &networking.StringMatch{
+							MatchType: &networking.StringMatch_Prefix{Prefix: "/api/v1/product"},
+						},
+					},
+					{
+						Uri: &networking.StringMatch{
+							MatchType: &networking.StringMatch_Prefix{Prefix: "/api/v1/products"},
+						},
+						Method: &networking.StringMatch{
+							MatchType: &networking.StringMatch_Exact{Exact: "GET"},
+						},
+					},
+				},
+			}},
+		}, valid: true, warning: true},
+		{name: "uri-with-prefix-exact", in: &networking.VirtualService{
+			Hosts: []string{"foo.bar"},
+			Http: []*networking.HTTPRoute{{
+				Route: []*networking.HTTPRouteDestination{{
+					Destination: &networking.Destination{Host: "foo.baz"},
+				}},
+				Match: []*networking.HTTPMatchRequest{
+					{
+						Uri: &networking.StringMatch{
+							MatchType: &networking.StringMatch_Prefix{Prefix: "/"},
+						},
+					},
+					{
+						Uri: &networking.StringMatch{
+							MatchType: &networking.StringMatch_Exact{Exact: "/"},
+						},
+						Method: &networking.StringMatch{
+							MatchType: &networking.StringMatch_Exact{Exact: "GET"},
+						},
+					},
+				},
+			}},
+		}, valid: true, warning: false},
 	}
 
 	for _, tc := range testCases {
@@ -2601,6 +2681,31 @@ func TestValidateWorkloadEntry(t *testing.T) {
 			name:  "missing address",
 			in:    &networking.WorkloadEntry{},
 			valid: false,
+		},
+		{
+			name:  "valid unix endpoint",
+			in:    &networking.WorkloadEntry{Address: "unix:///lon/google/com"},
+			valid: true,
+		},
+		{
+			name:  "invalid unix endpoint",
+			in:    &networking.WorkloadEntry{Address: "unix:///lon/google/com", Ports: map[string]uint32{"7777": 7777}},
+			valid: false,
+		},
+		{
+			name:  "valid FQDN",
+			in:    &networking.WorkloadEntry{Address: "validdns.com", Ports: map[string]uint32{"7777": 7777}},
+			valid: true,
+		},
+		{
+			name:  "invalid FQDN",
+			in:    &networking.WorkloadEntry{Address: "invaliddns.com:9443", Ports: map[string]uint32{"7777": 7777}},
+			valid: false,
+		},
+		{
+			name:  "valid IP",
+			in:    &networking.WorkloadEntry{Address: "172.16.1.1", Ports: map[string]uint32{"7777": 7777}},
+			valid: true,
 		},
 	}
 	for _, tc := range testCases {
@@ -3283,6 +3388,12 @@ func TestValidateOutlierDetection(t *testing.T) {
 			valid: true,
 			warn:  true,
 		},
+		{
+			name: "consecutive local origin errors is set but split local origin errors is not set", in: networking.OutlierDetection{
+				ConsecutiveLocalOriginFailures: &types.UInt32Value{Value: 10},
+			},
+			valid: false,
+		},
 	}
 
 	for _, c := range cases {
@@ -3388,7 +3499,7 @@ func TestValidateEnvoyFilter(t *testing.T) {
 		{name: "listener with invalid filter match", in: &networking.EnvoyFilter{
 			ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
 				{
-					ApplyTo: networking.EnvoyFilter_LISTENER,
+					ApplyTo: networking.EnvoyFilter_NETWORK_FILTER,
 					Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
 						ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_Listener{
 							Listener: &networking.EnvoyFilter_ListenerMatch{
@@ -3408,7 +3519,7 @@ func TestValidateEnvoyFilter(t *testing.T) {
 		{name: "listener with sub filter match and invalid applyTo", in: &networking.EnvoyFilter{
 			ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
 				{
-					ApplyTo: networking.EnvoyFilter_LISTENER,
+					ApplyTo: networking.EnvoyFilter_NETWORK_FILTER,
 					Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
 						ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_Listener{
 							Listener: &networking.EnvoyFilter_ListenerMatch{
@@ -4177,9 +4288,10 @@ func TestValidateServiceEntries(t *testing.T) {
 
 func TestValidateAuthorizationPolicy(t *testing.T) {
 	cases := []struct {
-		name  string
-		in    proto.Message
-		valid bool
+		name        string
+		annotations map[string]string
+		in          proto.Message
+		valid       bool
 	}{
 		{
 			name: "good",
@@ -4329,6 +4441,47 @@ func TestValidateAuthorizationPolicy(t *testing.T) {
 				Action: security_beta.AuthorizationPolicy_ALLOW,
 			},
 			valid: true,
+		},
+		{
+			name:        "dry-run-valid-allow",
+			annotations: map[string]string{"istio.io/dry-run": "true"},
+			in: &security_beta.AuthorizationPolicy{
+				Action: security_beta.AuthorizationPolicy_ALLOW,
+			},
+			valid: true,
+		},
+		{
+			name:        "dry-run-valid-deny",
+			annotations: map[string]string{"istio.io/dry-run": "false"},
+			in: &security_beta.AuthorizationPolicy{
+				Action: security_beta.AuthorizationPolicy_DENY,
+				Rules:  []*security_beta.Rule{{}},
+			},
+			valid: true,
+		},
+		{
+			name:        "dry-run-invalid-value",
+			annotations: map[string]string{"istio.io/dry-run": "foo"},
+			in: &security_beta.AuthorizationPolicy{
+				Action: security_beta.AuthorizationPolicy_ALLOW,
+			},
+			valid: false,
+		},
+		{
+			name:        "dry-run-invalid-action-custom",
+			annotations: map[string]string{"istio.io/dry-run": "true"},
+			in: &security_beta.AuthorizationPolicy{
+				Action: security_beta.AuthorizationPolicy_CUSTOM,
+			},
+			valid: false,
+		},
+		{
+			name:        "dry-run-invalid-action-audit",
+			annotations: map[string]string{"istio.io/dry-run": "true"},
+			in: &security_beta.AuthorizationPolicy{
+				Action: security_beta.AuthorizationPolicy_AUDIT,
+			},
+			valid: false,
 		},
 		{
 			name: "deny-rules-nil",
@@ -4954,8 +5107,9 @@ func TestValidateAuthorizationPolicy(t *testing.T) {
 	for _, c := range cases {
 		if _, got := ValidateAuthorizationPolicy(config.Config{
 			Meta: config.Meta{
-				Name:      "name",
-				Namespace: "namespace",
+				Name:        "name",
+				Namespace:   "namespace",
+				Annotations: c.annotations,
 			},
 			Spec: c.in,
 		}); (got == nil) != c.valid {
@@ -5696,10 +5850,11 @@ func TestValidationIPSubnet(t *testing.T) {
 
 func TestValidateRequestAuthentication(t *testing.T) {
 	cases := []struct {
-		name       string
-		configName string
-		in         proto.Message
-		valid      bool
+		name        string
+		configName  string
+		annotations map[string]string
+		in          proto.Message
+		valid       bool
 	}{
 		{
 			name:       "empty spec",
@@ -5720,6 +5875,13 @@ func TestValidateRequestAuthentication(t *testing.T) {
 			configName: someName,
 			in:         &security_beta.RequestAuthentication{},
 			valid:      true,
+		},
+		{
+			name:        "dry run annotation not supported",
+			configName:  someName,
+			annotations: map[string]string{"istio.io/dry-run": "true"},
+			in:          &security_beta.RequestAuthentication{},
+			valid:       false,
 		},
 		{
 			name:       "default name with non empty selector",
@@ -5871,14 +6033,53 @@ func TestValidateRequestAuthentication(t *testing.T) {
 			},
 			valid: true,
 		},
+		{
+			name:       "jwks ok",
+			configName: constants.DefaultAuthenticationPolicyName,
+			in: &security_beta.RequestAuthentication{
+				JwtRules: []*security_beta.JWTRule{
+					{
+						Issuer: "foo.com",
+						Jwks:   "{ \"keys\":[ {\"e\":\"AQAB\",\"kid\":\"DHFbpoIUqrY8t2zpA2qXfCmr5VO5ZEr4RzHU_-envvQ\",\"kty\":\"RSA\",\"n\":\"xAE7eB6qugXyCAG3yhh7pkDkT65pHymX-P7KfIupjf59vsdo91bSP9C8H07pSAGQO1MV_xFj9VswgsCg4R6otmg5PV2He95lZdHtOcU5DXIg_pbhLdKXbi66GlVeK6ABZOUW3WYtnNHD-91gVuoeJT_DwtGGcp4ignkgXfkiEm4sw-4sfb4qdt5oLbyVpmW6x9cfa7vs2WTfURiCrBoUqgBo_-4WTiULmmHSGZHOjzwa8WtrtOQGsAFjIbno85jp6MnGGGZPYZbDAa_b3y5u-YpW7ypZrvD8BgtKVjgtQgZhLAGezMt0ua3DRrWnKqTZ0BJ_EyxOGuHJrLsn00fnMQ\"}]}", // nolint: lll
+						FromHeaders: []*security_beta.JWTHeader{
+							{
+								Name:   "x-foo",
+								Prefix: "Bearer ",
+							},
+						},
+					},
+				},
+			},
+			valid: true,
+		},
+		{
+			name:       "jwks error",
+			configName: constants.DefaultAuthenticationPolicyName,
+			in: &security_beta.RequestAuthentication{
+				JwtRules: []*security_beta.JWTRule{
+					{
+						Issuer: "foo.com",
+						Jwks:   "foo",
+						FromHeaders: []*security_beta.JWTHeader{
+							{
+								Name:   "x-foo",
+								Prefix: "Bearer ",
+							},
+						},
+					},
+				},
+			},
+			valid: false,
+		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if _, got := ValidateRequestAuthentication(config.Config{
 				Meta: config.Meta{
-					Name:      c.configName,
-					Namespace: someNamespace,
+					Name:        c.configName,
+					Namespace:   someNamespace,
+					Annotations: c.annotations,
 				},
 				Spec: c.in,
 			}); (got == nil) != c.valid {

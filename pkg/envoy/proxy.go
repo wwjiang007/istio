@@ -20,20 +20,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path"
+	"strings"
 	"time"
 
 	"github.com/gogo/protobuf/types"
 
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/bootstrap"
 	"istio.io/pkg/env"
 	"istio.io/pkg/log"
-)
-
-const (
-	// epochFileTemplate is a template for the root config JSON
-	epochFileTemplate = "envoy-rev%d.json"
 )
 
 type envoy struct {
@@ -41,23 +34,40 @@ type envoy struct {
 	extraArgs []string
 }
 
+// Envoy binary flags
 type ProxyConfig struct {
-	*model.Node
 	LogLevel          string
 	ComponentLogLevel string
 	NodeIPs           []string
 	Sidecar           bool
 	LogAsJSON         bool
+	// TODO: outlier log path configuration belongs to mesh ProxyConfig
+	OutlierLogPath string
+
+	BinaryPath             string
+	ConfigPath             string
+	ConfigCleanup          bool
+	AdminPort              int32
+	DrainDuration          *types.Duration
+	ParentShutdownDuration *types.Duration
+	Concurrency            int32
+
+	// For unit testing, in combination with NoEnvoy prevents agent.Run from blocking
+	TestOnly bool
 }
 
 // NewProxy creates an instance of the proxy control commands
 func NewProxy(cfg ProxyConfig) Proxy {
 	// inject tracing flag for higher levels
 	var args []string
-	if cfg.LogLevel != "" {
-		args = append(args, "-l", cfg.LogLevel)
+	logLevel, componentLogs := splitComponentLog(cfg.LogLevel)
+	if logLevel != "" {
+		args = append(args, "-l", logLevel)
 	}
-	if cfg.ComponentLogLevel != "" {
+	if len(componentLogs) > 0 {
+		args = append(args, "--component-log-level", strings.Join(componentLogs, ","))
+	} else if cfg.ComponentLogLevel != "" {
+		// Use the old setting if we don't set any component log levels in LogLevel
 		args = append(args, "--component-log-level", cfg.ComponentLogLevel)
 	}
 
@@ -67,14 +77,38 @@ func NewProxy(cfg ProxyConfig) Proxy {
 	}
 }
 
+// splitComponentLog breaks down an argument string into a log level (ie "info") and component log levels (ie "misc:error").
+// This allows using a single log level API, with the same semantics as Istio's logging, to configure Envoy which
+// has two different settings
+func splitComponentLog(level string) (string, []string) {
+	levels := strings.Split(level, ",")
+	var logLevel string
+	var componentLogs []string
+	for _, sl := range levels {
+		spl := strings.Split(sl, ":")
+		if len(spl) == 1 {
+			logLevel = spl[0]
+		} else if len(spl) == 2 {
+			componentLogs = append(componentLogs, sl)
+		} else {
+			log.Warnf("dropping invalid log level: %v", sl)
+		}
+	}
+	return logLevel, componentLogs
+}
+
 func (e *envoy) Drain() error {
-	adminPort := uint32(e.Metadata.ProxyConfig.ProxyAdminPort)
+	adminPort := uint32(e.AdminPort)
 
 	err := DrainListeners(adminPort, e.Sidecar)
 	if err != nil {
 		log.Infof("failed draining listeners for Envoy on port %d: %v", adminPort, err)
 	}
 	return err
+}
+
+func (e *envoy) UpdateConfig(config []byte) error {
+	return ioutil.WriteFile(e.ConfigPath, config, 0o666)
 }
 
 func (e *envoy) args(fname string, epoch int, bootstrapConfig string) []string {
@@ -85,13 +119,18 @@ func (e *envoy) args(fname string, epoch int, bootstrapConfig string) []string {
 	startupArgs := []string{
 		"-c", fname,
 		"--restart-epoch", fmt.Sprint(epoch),
-		"--drain-time-s", fmt.Sprint(int(convertDuration(e.Metadata.ProxyConfig.DrainDuration) / time.Second)),
+		"--drain-time-s", fmt.Sprint(int(convertDuration(e.DrainDuration) / time.Second)),
 		"--drain-strategy", "immediate", // Clients are notified as soon as the drain process starts.
-		"--parent-shutdown-time-s", fmt.Sprint(int(convertDuration(e.Metadata.ProxyConfig.ParentShutdownDuration) / time.Second)),
-		"--service-cluster", e.Metadata.ProxyConfig.ServiceCluster,
-		"--service-node", e.ID,
+		"--parent-shutdown-time-s", fmt.Sprint(int(convertDuration(e.ParentShutdownDuration) / time.Second)),
 		"--local-address-ip-version", proxyLocalAddressType,
 		"--bootstrap-version", "3",
+		// Reduce default flush interval from 10s to 1s. The access log buffer size is 64k and each log is ~256 bytes
+		// This means access logs will be written once we have ~250 requests, or ever 1s, which ever comes first.
+		// Reducing this to 1s optimizes for UX while retaining performance.
+		// At low QPS access logs are unlikely a bottleneck, and these users will now see logs after 1s rather than 10s.
+		// At high QPS (>250 QPS) we will log the same amount as we will log due to exceeding buffer size, rather
+		// than the flush interval.
+		"--file-flush-interval-msec", "1000",
 		"--disable-hot-restart", // We don't use it, so disable it to simplify Envoy's logic
 	}
 	if e.ProxyConfig.LogAsJSON {
@@ -116,8 +155,8 @@ func (e *envoy) args(fname string, epoch int, bootstrapConfig string) []string {
 		}
 	}
 
-	if e.Metadata.ProxyConfig.Concurrency.GetValue() > 0 {
-		startupArgs = append(startupArgs, "--concurrency", fmt.Sprint(e.Metadata.ProxyConfig.Concurrency.GetValue()))
+	if e.Concurrency > 0 {
+		startupArgs = append(startupArgs, "--concurrency", fmt.Sprint(e.Concurrency))
 	}
 
 	return startupArgs
@@ -126,31 +165,12 @@ func (e *envoy) args(fname string, epoch int, bootstrapConfig string) []string {
 var istioBootstrapOverrideVar = env.RegisterStringVar("ISTIO_BOOTSTRAP_OVERRIDE", "", "")
 
 func (e *envoy) Run(epoch int, abort <-chan error) error {
-	config := e.Metadata.ProxyConfig
-	var fname string
-	// Note: the cert checking still works, the generated file is updated if certs are changed.
-	// We just don't save the generated file, but use a custom one instead. Pilot will keep
-	// monitoring the certs and restart if the content of the certs changes.
-	if len(config.CustomConfigFile) > 0 {
-		// there is a custom configuration. Don't write our own config - but keep watching the certs.
-		fname = config.CustomConfigFile
-	} else {
-		out, err := bootstrap.New(bootstrap.Config{
-			Node: e.Node,
-		}).CreateFileForEpoch(epoch)
-		if err != nil {
-			log.Error("Failed to generate bootstrap config: ", err)
-			os.Exit(1) // Prevent infinite loop attempting to write the file, let k8s/systemd report
-		}
-		fname = out
-	}
-
 	// spin up a new Envoy process
-	args := e.args(fname, epoch, istioBootstrapOverrideVar.Get())
+	args := e.args(e.ConfigPath, epoch, istioBootstrapOverrideVar.Get())
 	log.Infof("Envoy command: %v", args)
 
 	/* #nosec */
-	cmd := exec.Command(config.BinaryPath, args...)
+	cmd := exec.Command(e.BinaryPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -174,13 +194,10 @@ func (e *envoy) Run(epoch int, abort <-chan error) error {
 }
 
 func (e *envoy) Cleanup(epoch int) {
-	// should return when use the parameter "--templateFile=/path/xxx.tmpl".
-	if e.Metadata.ProxyConfig.CustomConfigFile != "" {
-		return
-	}
-	filePath := configFile(e.Metadata.ProxyConfig.ConfigPath, epoch)
-	if err := os.Remove(filePath); err != nil {
-		log.Warnf("Failed to delete config file %s for %d, %v", filePath, epoch, err)
+	if e.ConfigCleanup {
+		if err := os.Remove(e.ConfigPath); err != nil {
+			log.Warnf("Failed to delete config file %s for %d, %v", e.ConfigPath, epoch, err)
+		}
 	}
 }
 
@@ -194,10 +211,6 @@ func convertDuration(d *types.Duration) time.Duration {
 		log.Warnf("error converting duration %#v, using 0: %v", d, err)
 	}
 	return dur
-}
-
-func configFile(config string, epoch int) string {
-	return path.Join(config, fmt.Sprintf(epochFileTemplate, epoch))
 }
 
 // isIPv6Proxy check the addresses slice and returns true for a valid IPv6 address

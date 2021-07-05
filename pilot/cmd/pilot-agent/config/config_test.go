@@ -107,7 +107,7 @@ proxyStatsMatcher:
 			expect: func() meshconfig.ProxyConfig {
 				m := mesh.DefaultProxyConfig()
 				m.DiscoveryAddress = "annotation:123"
-				m.ProxyMetadata = map[string]string{"ANNOTATION": "something"}
+				m.ProxyMetadata = map[string]string{"ANNOTATION": "something", "SOME": "setting"}
 				m.DrainDuration = types.DurationProto(5 * time.Second)
 				m.ExtraStatTags = []string{"b"}
 				m.ProxyStatsMatcher = &meshconfig.ProxyConfig_ProxyStatsMatcher{}
@@ -122,7 +122,7 @@ proxyStatsMatcher:
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			proxyConfigEnv := tt.environment
-			got, err := getMeshConfig(tt.file, tt.annotation, proxyConfigEnv)
+			got, err := getMeshConfig(tt.file, tt.annotation, proxyConfigEnv, true)
 			if err != nil {
 				t.Fatal(err)
 			}

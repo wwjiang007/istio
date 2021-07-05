@@ -28,7 +28,6 @@ import (
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	rbac_http_filter "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	http_conn "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
-	"github.com/golang/protobuf/ptypes"
 	structpb "github.com/golang/protobuf/ptypes/struct"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/spf13/cobra"
@@ -45,7 +44,6 @@ import (
 	"istio.io/istio/istioctl/pkg/util/handlers"
 	istio_envoy_configdump "istio.io/istio/istioctl/pkg/writer/envoy/configdump"
 	"istio.io/istio/pilot/pkg/model"
-	pilot_v1alpha3 "istio.io/istio/pilot/pkg/networking/core/v1alpha3"
 	"istio.io/istio/pilot/pkg/networking/util"
 	authz_model "istio.io/istio/pilot/pkg/security/authz/model"
 	pilotcontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
@@ -149,6 +147,7 @@ the configuration objects that affect that pod.`,
 			// Now look for ingress gateways
 			return printIngressInfo(writer, matchingServices, podsLabels, client, configClient, kubeClient)
 		},
+		ValidArgsFunction: validPodsNameArgs,
 	}
 
 	cmd.PersistentFlags().BoolVar(&ignoreUnmeshed, "ignoreUnmeshed", false,
@@ -162,12 +161,14 @@ func describe() *cobra.Command {
 		Use:     "describe",
 		Aliases: []string{"des"},
 		Short:   "Describe resource and related Istio configuration",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cmd.HelpFunc()(cmd, args)
+		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) != 0 {
 				return fmt.Errorf("unknown resource type %q", args[0])
 			}
-
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.HelpFunc()(cmd, args)
 			return nil
 		},
 	}
@@ -175,26 +176,6 @@ func describe() *cobra.Command {
 	describeCmd.AddCommand(podDescribeCmd())
 	describeCmd.AddCommand(svcDescribeCmd())
 	return describeCmd
-}
-
-func validatePort(port v1.ServicePort, pod *v1.Pod) []string {
-	retval := []string{}
-
-	// Build list of ports exposed by pod
-	containerPorts := make(map[int]bool)
-	for _, container := range pod.Spec.Containers {
-		for _, port := range container.Ports {
-			containerPorts[int(port.ContainerPort)] = true
-		}
-	}
-
-	// Get port number used by the service port being validated
-	_, err := pilotcontroller.FindPort(pod, &port)
-	if err != nil {
-		retval = append(retval, err.Error())
-	}
-
-	return retval
 }
 
 func servicePortProtocol(name string) protocol.Instance {
@@ -419,6 +400,7 @@ func renderMatch(match *v1alpha3.HTTPMatchRequest) string {
 
 func printPod(writer io.Writer, pod *v1.Pod) {
 	ports := []string{}
+	UserID := int64(1337)
 	for _, container := range pod.Spec.Containers {
 		for _, port := range container.Ports {
 			var protocol string
@@ -427,6 +409,14 @@ func printPod(writer io.Writer, pod *v1.Pod) {
 				protocol = fmt.Sprintf("/%s", port.Protocol)
 			}
 			ports = append(ports, fmt.Sprintf("%d%s (%s)", port.ContainerPort, protocol, container.Name))
+		}
+		// Ref: https://istio.io/latest/docs/ops/deployment/requirements/#pod-requirements
+		if container.Name != "istio-proxy" && container.Name != "istio-operator" {
+			if container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
+				if *container.SecurityContext.RunAsUser == UserID {
+					fmt.Fprintf(writer, "WARNING: User ID (UID) 1337 is reserved for the sidecar proxy.\n")
+				}
+			}
 		}
 	}
 
@@ -455,6 +445,13 @@ func printPod(writer io.Writer, pod *v1.Pod) {
 	if !isMeshed(pod) {
 		fmt.Fprintf(writer, "WARNING: %s is not part of mesh; no Istio sidecar\n", kname(pod.ObjectMeta))
 		return
+	}
+
+	// Ref: https://istio.io/latest/docs/ops/deployment/requirements/#pod-requirements
+	if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.RunAsUser != nil {
+		if *pod.Spec.SecurityContext.RunAsUser == UserID {
+			fmt.Fprintf(writer, "   WARNING: User ID (UID) 1337 is reserved for the sidecar proxy.\n")
+		}
 	}
 
 	// https://istio.io/docs/setup/kubernetes/additional-setup/requirements/
@@ -497,10 +494,8 @@ func printService(writer io.Writer, svc v1.Service, pod *v1.Pod) {
 			}
 
 			fmt.Fprintf(writer, "   Port: %s %d/%s targets pod port %d\n", port.Name, port.Port, protocol, nport)
-		}
-		msgs := validatePort(port, pod)
-		for _, msg := range msgs {
-			fmt.Fprintf(writer, "   %s\n", msg)
+		} else {
+			fmt.Fprintf(writer, "   %s\n", err.Error())
 		}
 	}
 }
@@ -560,7 +555,7 @@ func getIstioRBACPolicies(cd *configdump.Wrapper, port int32) ([]string, error) 
 	for _, httpFilter := range hcm.HttpFilters {
 		if httpFilter.Name == authz_model.RBACHTTPFilterName {
 			rbac := &rbac_http_filter.RBAC{}
-			if err := ptypes.UnmarshalAny(httpFilter.GetTypedConfig(), rbac); err == nil {
+			if err := httpFilter.GetTypedConfig().UnmarshalTo(rbac); err == nil {
 				policies := []string{}
 				for polName := range rbac.Rules.Policies {
 					policies = append(policies, polName)
@@ -590,15 +585,15 @@ func getInboundHTTPConnectionManager(cd *configdump.Wrapper, port int32) (*http_
 		// Support v2 or v3 in config dump. See ads.go:RequestedTypes for more info.
 		l.ActiveState.Listener.TypeUrl = v3.ListenerType
 		listenerTyped := &listener.Listener{}
-		err = ptypes.UnmarshalAny(l.ActiveState.Listener, listenerTyped)
+		err = l.ActiveState.Listener.UnmarshalTo(listenerTyped)
 		if err != nil {
 			return nil, err
 		}
-		if listenerTyped.Name == pilot_v1alpha3.VirtualInboundListenerName {
+		if listenerTyped.Name == model.VirtualInboundListenerName {
 			for _, filterChain := range listenerTyped.FilterChains {
 				for _, filter := range filterChain.Filters {
 					hcm := &http_conn.HttpConnectionManager{}
-					if err := ptypes.UnmarshalAny(filter.GetTypedConfig(), hcm); err == nil {
+					if err := filter.GetTypedConfig().UnmarshalTo(hcm); err == nil {
 						return hcm, nil
 					}
 				}
@@ -618,7 +613,7 @@ func getInboundHTTPConnectionManager(cd *configdump.Wrapper, port int32) (*http_
 			for _, filterChain := range listenerTyped.FilterChains {
 				for _, filter := range filterChain.Filters {
 					hcm := &http_conn.HttpConnectionManager{}
-					if err := ptypes.UnmarshalAny(filter.GetTypedConfig(), hcm); err == nil {
+					if err := filter.GetTypedConfig().UnmarshalTo(hcm); err == nil {
 						return hcm, nil
 					}
 				}
@@ -657,7 +652,7 @@ func getIstioVirtualServicePathForSvcFromRoute(cd *configdump.Wrapper, svc v1.Se
 	}
 	for _, rcd := range rcd.DynamicRouteConfigs {
 		routeTyped := &route.RouteConfiguration{}
-		err = ptypes.UnmarshalAny(rcd.RouteConfig, routeTyped)
+		err = rcd.RouteConfig.UnmarshalTo(routeTyped)
 		if err != nil {
 			return "", err
 		}
@@ -763,7 +758,7 @@ func getIstioDestinationRulePathForSvc(cd *configdump.Wrapper, svc v1.Service, p
 		clusterTyped := &cluster.Cluster{}
 		// Support v2 or v3 in config dump. See ads.go:RequestedTypes for more info.
 		dac.Cluster.TypeUrl = v3.ClusterType
-		err = ptypes.UnmarshalAny(dac.Cluster, clusterTyped)
+		err = dac.Cluster.UnmarshalTo(clusterTyped)
 		if err != nil {
 			return "", err
 		}
@@ -884,7 +879,7 @@ func printIngressInfo(writer io.Writer, matchingServices []v1.Service, podsLabel
 	if len(ingressSvcs.Items) == 0 {
 		return fmt.Errorf("no ingress gateway service")
 	}
-	byConfigDump, err := client.EnvoyDo(context.TODO(), pod.Name, pod.Namespace, "GET", "config_dump", nil)
+	byConfigDump, err := client.EnvoyDo(context.TODO(), pod.Name, pod.Namespace, "GET", "config_dump")
 	if err != nil {
 		return fmt.Errorf("failed to execute command on ingress gateway sidecar: %v", err)
 	}
@@ -1093,6 +1088,7 @@ the configuration objects that affect that service.`,
 			// Now look for ingress gateways
 			return printIngressInfo(writer, svcs, podsLabels, client, configClient, kubeClient)
 		},
+		ValidArgsFunction: validServiceArgs,
 	}
 
 	cmd.PersistentFlags().BoolVar(&ignoreUnmeshed, "ignoreUnmeshed", false,
@@ -1102,9 +1098,7 @@ the configuration objects that affect that service.`,
 }
 
 func describePodServices(writer io.Writer, kubeClient kube.ExtendedClient, configClient istioclient.Interface, pod *v1.Pod, matchingServices []v1.Service, podsLabels []k8s_labels.Set) error { // nolint: lll
-	var err error
-
-	byConfigDump, err := kubeClient.EnvoyDo(context.TODO(), pod.ObjectMeta.Name, pod.ObjectMeta.Namespace, "GET", "config_dump", nil)
+	byConfigDump, err := kubeClient.EnvoyDo(context.TODO(), pod.ObjectMeta.Name, pod.ObjectMeta.Namespace, "GET", "config_dump")
 	if err != nil {
 		if ignoreUnmeshed {
 			return nil

@@ -18,8 +18,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
+	"text/tabwriter"
 
+	envoy_admin_v3 "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	"github.com/golang/protobuf/jsonpb"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/istioctl/pkg/util/configdump"
 	sdscompare "istio.io/istio/istioctl/pkg/writer/compare/sds"
@@ -45,7 +49,7 @@ func (c *ConfigWriter) Prime(b []byte) error {
 }
 
 // PrintBootstrapDump prints just the bootstrap config dump to the ConfigWriter stdout
-func (c *ConfigWriter) PrintBootstrapDump() error {
+func (c *ConfigWriter) PrintBootstrapDump(outputFormat string) error {
 	if c.configDump == nil {
 		return fmt.Errorf("config writer has not been primed")
 	}
@@ -54,14 +58,23 @@ func (c *ConfigWriter) PrintBootstrapDump() error {
 		return err
 	}
 	jsonm := &jsonpb.Marshaler{Indent: "    "}
-	if err := jsonm.Marshal(c.Stdout, bootstrapDump); err != nil {
+	out, err := jsonm.MarshalToString(bootstrapDump)
+	if err != nil {
 		return fmt.Errorf("unable to marshal bootstrap in Envoy config dump")
 	}
+	if outputFormat == "yaml" {
+		outbyte, err := yaml.JSONToYAML([]byte(out))
+		if err != nil {
+			return err
+		}
+		out = string(outbyte)
+	}
+	fmt.Fprintln(c.Stdout, out)
 	return nil
 }
 
 // PrintSecretDump prints just the secret config dump to the ConfigWriter stdout
-func (c *ConfigWriter) PrintSecretDump() error {
+func (c *ConfigWriter) PrintSecretDump(outputFormat string) error {
 	if c.configDump == nil {
 		return fmt.Errorf("config writer has not been primed")
 	}
@@ -70,9 +83,18 @@ func (c *ConfigWriter) PrintSecretDump() error {
 		return fmt.Errorf("sidecar doesn't support secrets: %v", err)
 	}
 	jsonm := &jsonpb.Marshaler{Indent: "    "}
-	if err := jsonm.Marshal(c.Stdout, secretDump); err != nil {
+	out, err := jsonm.MarshalToString(secretDump)
+	if err != nil {
 		return fmt.Errorf("unable to marshal secrets in Envoy config dump")
 	}
+	if outputFormat == "yaml" {
+		outbyte, err := yaml.JSONToYAML([]byte(out))
+		if err != nil {
+			return err
+		}
+		out = string(outbyte)
+	}
+	fmt.Fprintln(c.Stdout, out)
 	return nil
 }
 
@@ -113,4 +135,89 @@ func (c *ConfigWriter) PrintFullSummary(cf ClusterFilter, lf ListenerFilter, rf 
 		return err
 	}
 	return nil
+}
+
+// PrintVersionSummary prints version information for Istio and Envoy from the config dump
+func (c *ConfigWriter) PrintVersionSummary() error {
+	if c.configDump == nil {
+		return fmt.Errorf("config writer has not been primed")
+	}
+
+	bootstrapDump, err := c.configDump.GetBootstrapConfigDump()
+	if err != nil {
+		return err
+	}
+
+	var (
+		istioVersion, istioProxySha = c.getIstioVersionInfo(bootstrapDump)
+		envoyVersion                = c.getUserAgentVersionInfo(bootstrapDump)
+
+		tw = tabwriter.NewWriter(c.Stdout, 0, 8, 1, ' ', 0)
+	)
+
+	if len(istioVersion) > 0 {
+		fmt.Fprintf(tw, "Istio Version:\t%s\n", istioVersion)
+	}
+	if len(istioProxySha) > 0 {
+		fmt.Fprintf(tw, "Istio Proxy Version:\t%s\n", istioProxySha)
+	}
+	if len(envoyVersion) > 0 {
+		fmt.Fprintf(tw, "Envoy Version:\t%s\n", envoyVersion)
+	}
+
+	return tw.Flush()
+}
+
+func (c *ConfigWriter) getIstioVersionInfo(bootstrapDump *envoy_admin_v3.BootstrapConfigDump) (version, sha string) {
+	const (
+		istioVersionKey  = "ISTIO_VERSION"
+		istioProxyShaKey = "ISTIO_PROXY_SHA"
+	)
+
+	md := bootstrapDump.GetBootstrap().GetNode().GetMetadata().GetFields()
+
+	if versionPB, ok := md[istioVersionKey]; ok {
+		version = versionPB.GetStringValue()
+	}
+	if shaPB, ok := md[istioProxyShaKey]; ok {
+		sha = shaPB.GetStringValue()
+		if shaParts := strings.Split(sha, ":"); len(shaParts) > 1 {
+			sha = shaParts[1]
+		}
+	}
+
+	return
+}
+
+func (c *ConfigWriter) getUserAgentVersionInfo(bootstrapDump *envoy_admin_v3.BootstrapConfigDump) string {
+	const (
+		buildLabelKey = "build.label"
+		buildTypeKey  = "build.type"
+		statusKey     = "revision.status"
+		sslVersionKey = "ssl.version"
+	)
+
+	var (
+		buildVersion = bootstrapDump.GetBootstrap().GetNode().GetUserAgentBuildVersion()
+		version      = buildVersion.GetVersion()
+		md           = buildVersion.GetMetadata().GetFields()
+
+		sb strings.Builder
+	)
+
+	fmt.Fprintf(&sb, "%d.%d.%d", version.GetMajorNumber(), version.GetMinorNumber(), version.GetPatch())
+	if label, ok := md[buildLabelKey]; ok {
+		fmt.Fprintf(&sb, "-%s", label.GetStringValue())
+	}
+	if status, ok := md[statusKey]; ok {
+		fmt.Fprintf(&sb, "/%s", status.GetStringValue())
+	}
+	if typ, ok := md[buildTypeKey]; ok {
+		fmt.Fprintf(&sb, "/%s", typ.GetStringValue())
+	}
+	if sslVersion, ok := md[sslVersionKey]; ok {
+		fmt.Fprintf(&sb, "/%s", sslVersion.GetStringValue())
+	}
+
+	return sb.String()
 }

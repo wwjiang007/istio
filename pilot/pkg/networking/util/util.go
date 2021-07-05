@@ -36,16 +36,17 @@ import (
 	"github.com/golang/protobuf/ptypes/duration"
 	pstruct "github.com/golang/protobuf/ptypes/struct"
 	"github.com/golang/protobuf/ptypes/wrappers"
-	"github.com/hashicorp/go-multierror"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
-	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/util/strcase"
 	"istio.io/pkg/log"
 )
@@ -67,9 +68,6 @@ const (
 	// Inbound pass through cluster need to the bind the loopback ip address for the security and loop avoidance.
 	InboundPassthroughClusterIpv4 = "InboundPassthroughClusterIpv4"
 	InboundPassthroughClusterIpv6 = "InboundPassthroughClusterIpv6"
-	// 6 is the magical number for inbound: 15006, 127.0.0.6, ::6
-	InboundPassthroughBindIpv4 = "127.0.0.6"
-	InboundPassthroughBindIpv6 = "::6"
 
 	// SniClusterFilter is the name of the sni_cluster envoy filter
 	SniClusterFilter = "envoy.filters.network.sni_cluster"
@@ -125,23 +123,6 @@ var ALPNHttp = []string{"h2", "http/1.1"}
 
 // ALPNDownstream advertises that Proxy is going to talking either tcp(for metadata exchange), http2 or http 1.1.
 var ALPNDownstream = []string{"istio-peer-exchange", "h2", "http/1.1"}
-
-// FallThroughFilterChainBlackHoleService is the blackhole service used for fall though
-// filter chain
-var FallThroughFilterChainBlackHoleService = &model.Service{
-	Hostname: host.Name(BlackHoleCluster),
-	Attributes: model.ServiceAttributes{
-		Name: BlackHoleCluster,
-	},
-}
-
-// FallThroughFilterChainPassthroughService is the passthrough service used for fall though
-var FallThroughFilterChainPassthroughService = &model.Service{
-	Hostname: host.Name(PassthroughCluster),
-	Attributes: model.ServiceAttributes{
-		Name: PassthroughCluster,
-	},
-}
 
 func getMaxCidrPrefix(addr string) uint32 {
 	ip := net.ParseIP(addr)
@@ -254,7 +235,7 @@ func GogoDurationToDuration(d *types.Duration) *duration.Duration {
 		log.Warnf("error converting duration %#v, using 0: %v", d, err)
 		return nil
 	}
-	return ptypes.DurationProto(dur)
+	return durationpb.New(dur)
 }
 
 // SortVirtualHosts sorts a slice of virtual hosts by name.
@@ -268,12 +249,6 @@ func SortVirtualHosts(hosts []*route.VirtualHost) {
 	sort.SliceStable(hosts, func(i, j int) bool {
 		return hosts[i].Name < hosts[j].Name
 	})
-}
-
-// IsIstioVersionGE19 checks whether the given Istio version is greater than or equals 1.9.
-func IsIstioVersionGE19(node *model.Proxy) bool {
-	return node == nil || node.IstioVersion == nil ||
-		node.IstioVersion.Compare(&model.IstioVersion{Major: 1, Minor: 9, Patch: -1}) >= 0
 }
 
 func IsProtocolSniffingEnabledForPort(port *model.Port) bool {
@@ -444,9 +419,11 @@ func IsHTTPFilterChain(filterChain *listener.FilterChain) bool {
 func MergeAnyWithStruct(a *any.Any, pbStruct *pstruct.Struct) (*any.Any, error) {
 	// Assuming that Pilot is compiled with this type [which should always be the case]
 	var err error
+	// nolint: staticcheck
 	var x ptypes.DynamicAny
 
 	// First get an object of type used by this message
+	// nolint: staticcheck
 	if err = ptypes.UnmarshalAny(a, &x); err != nil {
 		return nil, err
 	}
@@ -462,6 +439,7 @@ func MergeAnyWithStruct(a *any.Any, pbStruct *pstruct.Struct) (*any.Any, error) 
 	proto.Merge(x.Message, temp)
 	var retVal *any.Any
 	// Convert the merged proto back to any
+	// nolint: staticcheck
 	if retVal, err = ptypes.MarshalAny(x.Message); err != nil {
 		return nil, err
 	}
@@ -474,14 +452,17 @@ func MergeAnyWithStruct(a *any.Any, pbStruct *pstruct.Struct) (*any.Any, error) 
 func MergeAnyWithAny(dst *any.Any, src *any.Any) (*any.Any, error) {
 	// Assuming that Pilot is compiled with this type [which should always be the case]
 	var err error
+	// nolint: staticcheck
 	var dstX, srcX ptypes.DynamicAny
 
 	// get an object of type used by this message
+	// nolint: staticcheck
 	if err = ptypes.UnmarshalAny(dst, &dstX); err != nil {
 		return nil, err
 	}
 
 	// get an object of type used by this message
+	// nolint: staticcheck
 	if err = ptypes.UnmarshalAny(src, &srcX); err != nil {
 		return nil, err
 	}
@@ -490,6 +471,7 @@ func MergeAnyWithAny(dst *any.Any, src *any.Any) (*any.Any, error) {
 	proto.Merge(dstX.Message, srcX.Message)
 	var retVal *any.Any
 	// Convert the merged proto back to dst
+	// nolint: staticcheck
 	if retVal, err = ptypes.MarshalAny(dstX.Message); err != nil {
 		return nil, err
 	}
@@ -498,17 +480,14 @@ func MergeAnyWithAny(dst *any.Any, src *any.Any) (*any.Any, error) {
 }
 
 // BuildLbEndpointMetadata adds metadata values to a lb endpoint
-func BuildLbEndpointMetadata(network, tlsMode, workloadname, namespace, clusterID string, labels labels.Instance) *core.Metadata {
-	if network == "" && (tlsMode == "" || tlsMode == model.DisabledTLSModeLabel) && !features.EndpointTelemetryLabel {
+func BuildLbEndpointMetadata(networkID network.ID, tlsMode, workloadname, namespace string,
+	clusterID cluster.ID, labels labels.Instance) *core.Metadata {
+	if networkID == "" && (tlsMode == "" || tlsMode == model.DisabledTLSModeLabel) && !features.EndpointTelemetryLabel {
 		return nil
 	}
 
 	metadata := &core.Metadata{
 		FilterMetadata: map[string]*pstruct.Struct{},
-	}
-
-	if network != "" {
-		addIstioEndpointLabel(metadata, "network", &pstruct.Value{Kind: &pstruct.Value_StringValue{StringValue: network}})
 	}
 
 	if tlsMode != "" && tlsMode != model.DisabledTLSModeLabel {
@@ -538,7 +517,7 @@ func BuildLbEndpointMetadata(network, tlsMode, workloadname, namespace, clusterI
 			sb.WriteString(csr)
 		}
 		sb.WriteString(";")
-		sb.WriteString(clusterID)
+		sb.WriteString(clusterID.String())
 		addIstioEndpointLabel(metadata, "workload", &pstruct.Value{Kind: &pstruct.Value_StringValue{StringValue: sb.String()}})
 	}
 
@@ -669,25 +648,6 @@ func toIPNet(c *core.CidrRange) (*net.IPNet, error) {
 // due to the UNDEFINED in the meshconfig ForwardClientCertDetails
 func MeshConfigToEnvoyForwardClientCertDetails(c meshconfig.Topology_ForwardClientCertDetails) http_conn.HttpConnectionManager_ForwardClientCertDetails {
 	return http_conn.HttpConnectionManager_ForwardClientCertDetails(c - 1)
-}
-
-// MultiErrorFormat provides a format for multierrors. This matches the default format, but if there
-// is only one error we will not expand to multiple lines.
-func MultiErrorFormat() multierror.ErrorFormatFunc {
-	return func(es []error) string {
-		if len(es) == 1 {
-			return es[0].Error()
-		}
-
-		points := make([]string, len(es))
-		for i, err := range es {
-			points[i] = fmt.Sprintf("* %s", err)
-		}
-
-		return fmt.Sprintf(
-			"%d errors occurred:\n\t%s\n\n",
-			len(es), strings.Join(points, "\n\t"))
-	}
 }
 
 // ByteCount returns a human readable byte format

@@ -28,6 +28,10 @@ const (
 	ProxyContainerName     = "istio-proxy"
 	DiscoveryContainerName = "discovery"
 	OperatorContainerName  = "istio-operator"
+
+	// namespaceAll is the default argument of across all namespaces
+	NamespaceAll    = ""
+	StrNamespaceAll = "allNamespaces"
 )
 
 type kv struct {
@@ -52,12 +56,16 @@ var versionMap = map[string]*resourceNames{
 			"debug/syncz",
 			"debug/registryz",
 			"debug/endpointz",
+			"debug/instancesz",
 			"debug/endpointShardz",
 			"debug/configz",
+			"debug/cachez",
 			"debug/resourcesz",
 			"debug/authorizationz",
 			"debug/push_status",
 			"debug/inject",
+			"debug/mesh",
+			"debug/networkz",
 		},
 		proxyDebugURLs: []string{
 			"certs",
